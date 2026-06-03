@@ -128,7 +128,7 @@ function buildStatePayload(workspace, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.4-main2' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.5-main2' });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -306,7 +306,7 @@ app.post('/api/claims/bulk-pdf', authRequired, upload.single('pdf'), async (req,
     const dataUrl = `data:application/pdf;base64,${pdfBase64}`;
     const pdfMeta = { fileName: req.file.originalname, dataUrl };
 
-    const rows = await extractBillsFromBulkPdf(pdfBase64, apiKey);
+    const { bills: rows, partial } = await extractBillsFromBulkPdf(pdfBase64, apiKey);
     if (!rows.length) {
       return res.status(422).json({ error: 'No bills detected in this PDF.' });
     }
@@ -328,7 +328,14 @@ app.post('/api/claims/bulk-pdf', authRequired, upload.single('pdf'), async (req,
       created.push(claim);
     }
 
-    res.status(201).json({ count: created.length, claims: created });
+    res.status(201).json({
+      count: created.length,
+      claims: created,
+      partial,
+      warning: partial
+        ? 'Some bills may be missing — AI output was truncated. Split large PDFs if needed.'
+        : undefined,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Bulk PDF processing failed' });

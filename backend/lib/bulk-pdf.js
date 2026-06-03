@@ -35,38 +35,40 @@ function normalizeIsoDate(raw) {
 }
 
 async function extractBillsFromBulkPdf(pdfBase64, apiKey) {
-  const roster = AUDITOR_MASTER.map((a) => `${a.empCode}: ${a.name} (${a.cluster})`).join('\n');
+  const roster = AUDITOR_MASTER.map((a) => `${a.empCode}: ${a.name}`).join('\n');
 
-  const prompt = `You are an expense OCR agent. This PDF may contain multiple reimbursement bills from different field sales auditors.
+  const prompt = `You are an expense OCR agent. This PDF may contain many reimbursement bills from different field sales auditors.
 
 Known auditors (match by employee code or name):
 ${roster}
 
-Extract EVERY distinct bill/receipt. Respond ONLY with JSON:
+Extract EVERY distinct bill/receipt in the PDF. Return compact valid JSON only (no markdown, no commentary). Omit null fields. Keep vendor names short.
+
 {
   "bills": [
     {
       "auditorName": "string",
-      "auditorCode": "emp code or null",
+      "auditorCode": "emp code or omit",
       "expenseDate": "YYYY-MM-DD",
-      "expenseTime": "HH:MM or null",
+      "expenseTime": "HH:MM",
       "category": "TA or DA",
       "subcategory": "train|flight|bus|accommodation|cab|food|cash|daily",
       "billType": "train_ticket|flight_ticket|bus_ticket|hotel_invoice|cab_receipt|restaurant_receipt|other",
-      "amount": number,
-      "billDate": "YYYY-MM-DD or null",
-      "billTime": "HH:MM or null",
-      "billAmount": number or null,
-      "vendor": "string or null",
+      "amount": 0,
+      "billDate": "YYYY-MM-DD",
+      "billTime": "HH:MM",
+      "billAmount": 0,
+      "vendor": "string",
       "cityType": "metro|non_metro",
-      "pageHint": "page or section"
+      "pageHint": "page N"
     }
   ]
 }`;
 
-  const text = await callAnthropic({
+  const { text, stopReason } = await callAnthropic({
     apiKey,
-    maxTokens: 4096,
+    maxTokens: 16384,
+    withMeta: true,
     userContent: [
       { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: pdfBase64 } },
       { type: 'text', text: prompt },
@@ -77,7 +79,13 @@ Extract EVERY distinct bill/receipt. Respond ONLY with JSON:
   if (!parsed.bills || !Array.isArray(parsed.bills)) {
     throw new Error('AI did not return a bills array from the PDF.');
   }
-  return parsed.bills;
+  if (!parsed.bills.length && stopReason === 'max_tokens') {
+    throw new Error('PDF is too large — AI output was truncated. Try splitting into smaller PDFs.');
+  }
+  if (parsed._partial || stopReason === 'max_tokens') {
+    parsed._partial = true;
+  }
+  return { bills: parsed.bills, partial: !!parsed._partial };
 }
 
 function buildClaimFromExtractedBill(row, pdfMeta) {

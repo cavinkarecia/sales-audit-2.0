@@ -68,7 +68,8 @@ async function callAnthropicOnce(model, { apiKey, system, userContent, maxTokens
   }
 
   const data = await resp.json();
-  return (data.content || []).map((c) => c.text || '').join('').trim();
+  const text = (data.content || []).map((c) => c.text || '').join('').trim();
+  return { text, stopReason: data.stop_reason || null };
 }
 
 async function callAnthropic(opts = {}) {
@@ -77,7 +78,8 @@ async function callAnthropic(opts = {}) {
   let lastErr = null;
   for (const model of models) {
     try {
-      return await callAnthropicOnce(model, opts);
+      const result = await callAnthropicOnce(model, { ...opts, maxTokens });
+      return opts.withMeta ? result : result.text;
     } catch (err) {
       lastErr = err;
       if (!err.isModelError && err.status !== 404) throw err;
@@ -86,9 +88,74 @@ async function callAnthropic(opts = {}) {
   throw lastErr || new Error('All AI models failed');
 }
 
+function extractJsonBlock(text) {
+  let cleaned = String(text || '')
+    .replace(/```json\n?/gi, '')
+    .replace(/```/g, '')
+    .trim();
+  const start = cleaned.indexOf('{');
+  if (start >= 0) cleaned = cleaned.slice(start);
+  return cleaned;
+}
+
+function salvageTruncatedBillsJson(text) {
+  const billsKeyIdx = text.indexOf('"bills"');
+  if (billsKeyIdx === -1) return null;
+
+  const arrStart = text.indexOf('[', billsKeyIdx);
+  if (arrStart === -1) return null;
+
+  const bills = [];
+  let i = arrStart + 1;
+
+  while (i < text.length) {
+    while (i < text.length && /[\s,]/.test(text[i])) i += 1;
+    if (i >= text.length || text[i] === ']') break;
+    if (text[i] !== '{') break;
+
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    const objStart = i;
+
+    for (; i < text.length; i += 1) {
+      const ch = text[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') {
+        inStr = true;
+      } else if (ch === '{') {
+        depth += 1;
+      } else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) {
+          const chunk = text.slice(objStart, i + 1);
+          try {
+            bills.push(JSON.parse(chunk));
+          } catch {
+            /* skip malformed object */
+          }
+          i += 1;
+          break;
+        }
+      }
+    }
+  }
+
+  return bills.length ? { bills, _partial: true } : null;
+}
+
 function parseJsonFromModel(text) {
-  const cleaned = text.replace(/```json\n?|```/g, '').trim();
-  return JSON.parse(cleaned);
+  const cleaned = extractJsonBlock(text);
+  try {
+    return JSON.parse(cleaned);
+  } catch (err) {
+    const salvaged = salvageTruncatedBillsJson(cleaned);
+    if (salvaged) return salvaged;
+    throw err;
+  }
 }
 
 module.exports = { callAnthropic, parseJsonFromModel, MODEL, DEFAULT_MODEL };
