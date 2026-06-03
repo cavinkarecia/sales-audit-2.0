@@ -120,6 +120,11 @@ html, body {
   border-color: transparent;
 }
 .btn-primary:hover { filter: brightness(1.1); }
+.btn:disabled, .btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  pointer-events: none;
+}
 .btn svg { width: 13px; height: 13px; stroke-width: 2; }
 
 .file-chip {
@@ -1555,7 +1560,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.5';
+const SENTINEL_BUILD = '2026.06.6';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -3815,8 +3820,17 @@ $('new-claim-btn').addEventListener('click', openClaimModal);
 let pendingBulkPdfFile = null;
 const bulkClaimModal = $('bulk-claim-modal-backdrop');
 
+function isPdfFile(file) {
+  if (!file) return false;
+  const type = String(file.type || '').toLowerCase();
+  if (type === 'application/pdf' || type === 'application/x-pdf') return true;
+  return /\.pdf$/i.test(String(file.name || ''));
+}
+
 function openBulkClaimModal() {
   pendingBulkPdfFile = null;
+  const input = $('bulk-pdf-input');
+  if (input) input.value = '';
   $('bulk-pdf-preview').innerHTML = `
     <div style="font-size:13px;font-weight:500">Click to upload bulk PDF</div>
     <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Multiple auditors' bills in one file · max 15 MB</div>`;
@@ -3835,13 +3849,31 @@ $('bulk-pdf-drop').addEventListener('click', () => $('bulk-pdf-input').click());
 $('bulk-pdf-input').addEventListener('change', (e) => {
   const file = e.target.files?.[0];
   if (file) {
-    if (file.type !== 'application/pdf') { alert('PDF only.'); return; }
-    if (file.size > 15 * 1024 * 1024) { alert('Max 15 MB.'); return; }
+    if (!isPdfFile(file)) { alert('PDF only.'); e.target.value = ''; return; }
+    if (file.size > 15 * 1024 * 1024) { alert('Max 15 MB.'); e.target.value = ''; return; }
     pendingBulkPdfFile = file;
     $('bulk-pdf-preview').innerHTML = `<div class="bill-name">${escapeHtml(file.name)}</div><div class="bill-meta">${(file.size/1024).toFixed(1)} KB · ready</div>`;
     $('bulk-claim-process').disabled = false;
+    $('bulk-result').classList.add('hidden');
   }
 });
+
+async function pollBulkPdfJob(jobId) {
+  const deadline = Date.now() + 8 * 60 * 1000;
+  while (Date.now() < deadline) {
+    const resp = await apiFetch(`/api/claims/bulk-pdf/${encodeURIComponent(jobId)}`);
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || 'Could not check bulk upload status');
+
+    if (data.message) $('bulk-progress-text').textContent = data.message;
+
+    if (data.status === 'done') return data;
+    if (data.status === 'failed') throw new Error(data.error || 'Bulk upload failed');
+
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+  }
+  throw new Error('Bulk upload timed out after 8 minutes. Try a smaller PDF or split by auditor.');
+}
 
 function claimPassFail(c) {
   if (c.verdict === 'pending') return 'pending';
@@ -3850,7 +3882,10 @@ function claimPassFail(c) {
 }
 
 $('bulk-claim-process').addEventListener('click', async () => {
-  if (!pendingBulkPdfFile) return;
+  if (!pendingBulkPdfFile) {
+    alert('Select a PDF first — click the upload box above.');
+    return;
+  }
   if (!STATE.claudeApiKey && !isInArtifactContext()) {
     alert('Set Anthropic API key first (AI Key chip).');
     openApiKeyModal();
@@ -3862,32 +3897,42 @@ $('bulk-claim-process').addEventListener('click', async () => {
   }
   $('bulk-progress').classList.remove('hidden');
   $('bulk-result').classList.add('hidden');
-  $('bulk-progress-text').textContent = 'AI scanning PDF for bills…';
+  $('bulk-progress-text').textContent = 'Uploading PDF…';
   $('bulk-claim-process').disabled = true;
   try {
     await ensureBackendSession();
     const fd = new FormData();
     fd.append('pdf', pendingBulkPdfFile);
     const resp = await apiFetch('/api/claims/bulk-pdf', { method: 'POST', body: fd });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || 'Bulk upload failed');
-    for (const c of data.claims || []) STATE.claims.unshift(c);
+    const startData = await resp.json().catch(() => null);
+    if (!resp.ok) throw new Error(startData?.error || `Bulk upload failed (${resp.status})`);
+    if (!startData?.jobId) throw new Error('Server did not start bulk upload job.');
+
+    $('bulk-progress-text').textContent = startData.message || 'AI scanning PDF for bills…';
+    const data = await pollBulkPdfJob(startData.jobId);
+
+    if (!data.count || !Array.isArray(data.claims)) {
+      throw new Error('Upload finished but no expenses were returned.');
+    }
+
+    for (const c of data.claims) STATE.claims.unshift(c);
     renderClaimsList();
     renderExpenseValidationStats();
-    const passN = (data.claims || []).filter(c => claimPassFail(c) === 'pass').length;
-    const failN = (data.claims || []).filter(c => claimPassFail(c) === 'fail').length;
+    const passN = data.claims.filter(c => claimPassFail(c) === 'pass').length;
+    const failN = data.claims.filter(c => claimPassFail(c) === 'fail').length;
     const partialNote = data.partial && data.warning
       ? `<div style="margin-top:8px;font-size:12px;color:var(--amber)">${escapeHtml(data.warning)}</div>`
       : '';
     $('bulk-result').classList.remove('hidden');
-    $('bulk-result').innerHTML = `<div style="padding:12px;border-radius:8px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25)">Created <strong>${data.count}</strong> expenses · <span style="color:var(--green)">${passN} Pass</span> · <span style="color:var(--red)">${failN} Fail</span>${partialNote}</div>`;
+    $('bulk-result').innerHTML = `<div style="padding:12px;border-radius:8px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25)">Created <strong>${data.count}</strong> expenses · <span style="color:var(--green)">${passN} Pass</span> · <span style="color:var(--red)">${failN} Fail</span>${partialNote}<div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Scroll down to Expense Claims to review them.</div></div>`;
     $('bulk-progress-text').textContent = 'Done.';
-    setTimeout(closeBulkClaimModal, 1500);
+    pendingBulkPdfFile = null;
+    $('bulk-claim-process').disabled = true;
   } catch (err) {
     $('bulk-result').classList.remove('hidden');
-    $('bulk-result').innerHTML = `<div style="padding:12px;color:var(--red)">${escapeHtml(err.message)}</div>`;
+    $('bulk-result').innerHTML = `<div style="padding:12px;color:var(--red)">${escapeHtml(err.message || 'Bulk upload failed')}</div>`;
     $('bulk-progress-text').textContent = 'Failed.';
-    $('bulk-claim-process').disabled = false;
+    $('bulk-claim-process').disabled = !pendingBulkPdfFile;
   }
 });
 

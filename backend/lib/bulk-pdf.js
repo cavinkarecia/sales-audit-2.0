@@ -88,16 +88,17 @@ Extract EVERY distinct bill/receipt in the PDF. Return compact valid JSON only (
   return { bills: parsed.bills, partial: !!parsed._partial };
 }
 
-function buildClaimFromExtractedBill(row, pdfMeta) {
+function buildClaimFromExtractedBill(row, pdfMeta, index = 0) {
   const mapped = BILL_TYPE_TO_SUB[row.billType] || BILL_TYPE_TO_SUB.other;
   const category = row.category === 'DA' ? 'DA' : mapped.category;
   const subcategory = row.subcategory || mapped.subcategory;
   const auditor = resolveAuditor(row.auditorCode || row.auditorName);
   const date = normalizeIsoDate(row.expenseDate || row.billDate) || new Date().toISOString().slice(0, 10);
   const amount = Number(row.amount || row.billAmount) || 0;
+  const suffix = `${Date.now().toString(36).toUpperCase()}-${index}-${Math.random().toString(36).slice(2, 5)}`;
 
   return {
-    id: `CL-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 5)}`,
+    id: `CL-${suffix}`,
     submittedAt: new Date().toISOString(),
     auditorCode: auditor?.empCode || row.auditorCode || 'UNKNOWN',
     auditorName: auditor?.name || row.auditorName || 'Unknown auditor',
@@ -112,7 +113,7 @@ function buildClaimFromExtractedBill(row, pdfMeta) {
     reason: '',
     notes: row.pageHint ? `Bulk PDF · ${row.pageHint}` : `Bulk PDF · ${pdfMeta.fileName}`,
     billFileName: pdfMeta.fileName,
-    billDataUrl: pdfMeta.dataUrl,
+    billHash: pdfMeta.pdfHash || null,
     billMimeType: 'application/pdf',
     verdict: 'pending',
     verdictDetails: null,
@@ -125,7 +126,14 @@ function buildClaimFromExtractedBill(row, pdfMeta) {
   };
 }
 
+function slimClaimForClient(claim) {
+  const copy = { ...claim };
+  delete copy.billDataUrl;
+  return copy;
+}
+
 module.exports = {
   extractBillsFromBulkPdf,
   buildClaimFromExtractedBill,
+  slimClaimForClient,
 };
