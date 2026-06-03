@@ -14,6 +14,7 @@ const { parseAttendanceBuffer, parsePjpBuffer, pickDefaultDate } = require('./li
 const { dateKey } = require('./lib/utils');
 const { rosterAiReview } = require('./lib/claims');
 const { processClaim } = require('./lib/claim-processor');
+const { extractBillsFromBulkPdf, buildClaimFromExtractedBill } = require('./lib/bulk-pdf');
 const { loadExpenseRegistry, deleteRegistryEntry } = require('./lib/expense-validation');
 
 const PORT = process.env.PORT || 3000;
@@ -129,7 +130,7 @@ function buildStatePayload(workspace, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.3-main2' });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -289,6 +290,54 @@ app.get('/api/claims', authRequired, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/claims/bulk-pdf', authRequired, upload.single('pdf'), async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const apiKey = getClientApiKey(req);
+    if (!apiKey) {
+      return res.status(400).json({
+        error: 'Paste your Anthropic API key using the "AI Key" chip in the header.',
+      });
+    }
+    if (!req.file || req.file.mimetype !== 'application/pdf') {
+      return res.status(400).json({ error: 'Upload a PDF file.' });
+    }
+
+    const workspace = await loadWorkspace(sessionId);
+    const pdfBase64 = req.file.buffer.toString('base64');
+    const dataUrl = `data:application/pdf;base64,${pdfBase64}`;
+    const pdfMeta = { fileName: req.file.originalname, dataUrl };
+
+    const rows = await extractBillsFromBulkPdf(pdfBase64, apiKey);
+    if (!rows.length) {
+      return res.status(422).json({ error: 'No bills detected in this PDF.' });
+    }
+
+    const created = [];
+    for (const row of rows) {
+      const claim = buildClaimFromExtractedBill(row, pdfMeta);
+      const workspaceForClaim = {
+        ...workspace,
+        claims: [...created, ...workspace.claims],
+      };
+      await processClaim(claim, workspaceForClaim, sessionId, { apiKey, skipAi: true });
+      await ensureSession(sessionId);
+      await getPool().query(
+        `INSERT INTO claims (id, session_id, payload, created_at, updated_at)
+         VALUES ($1, $2, $3::jsonb, NOW(), NOW())`,
+        [claim.id, sessionId, JSON.stringify(claim)]
+      );
+      created.push(claim);
+    }
+
+    res.status(201).json({ count: created.length, claims: created });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Bulk PDF processing failed' });
   }
 });
 
