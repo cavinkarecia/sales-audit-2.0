@@ -358,6 +358,27 @@ html, body {
 /* ===== MAP ===== */
 .map-wrap { height: 480px; position: relative; }
 #map { height: 100%; width: 100%; background: var(--bg-2); }
+.map-pjp-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.map-pjp-section.hidden { display: none; }
+.map-pjp-table-wrap {
+  max-height: 320px;
+  overflow: auto;
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.map-pjp-table-wrap .table { margin: 0; }
+.map-pjp-table-wrap .table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg-2);
+  z-index: 1;
+}
+.legend-dot.dot-plan { background: #a855f7; }
 .map-legend {
   position: absolute;
   bottom: 12px; left: 12px;
@@ -929,11 +950,14 @@ html, body {
               <div class="panel-title">Geographic Footprint</div>
               <div class="panel-sub" id="map-sub">Live auditor positions</div>
             </div>
-            <div style="display:flex;gap:8px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <select class="select" id="map-filter">
                 <option value="all">All auditors</option>
                 <option value="on_field">On field only</option>
                 <option value="absent">Absent only</option>
+              </select>
+              <select class="select" id="map-pjp-auditor" style="min-width:220px" disabled>
+                <option value="">PJP plan — select auditor</option>
               </select>
             </div>
           </div>
@@ -944,7 +968,28 @@ html, body {
                 <div class="legend-item"><span class="legend-dot dot-on"></span> On Field (current)</div>
                 <div class="legend-item"><span class="legend-dot dot-absent"></span> Absent (current)</div>
                 <div class="legend-item"><span class="legend-dot dot-base"></span> Home Base</div>
-                <div class="legend-item"><span class="legend-line"></span> Base → Current</div>
+                <div class="legend-item"><span class="legend-dot dot-plan"></span> Planned (PJP)</div>
+                <div class="legend-item"><span class="legend-line"></span> Base → Current / Plan path</div>
+              </div>
+            </div>
+            <div id="map-pjp-section" class="map-pjp-section hidden">
+              <div class="panel-title" id="map-pjp-title" style="font-size:14px">30-day PJP plan</div>
+              <div class="panel-sub" id="map-pjp-sub">Planned locations by date</div>
+              <div class="map-pjp-table-wrap">
+                <table class="table" id="map-pjp-table">
+                  <thead>
+                    <tr>
+                      <th>Date</th>
+                      <th>Day</th>
+                      <th>Work type</th>
+                      <th>From</th>
+                      <th>To (planned)</th>
+                      <th>Kms</th>
+                      <th>Hotel</th>
+                    </tr>
+                  </thead>
+                  <tbody id="map-pjp-tbody"></tbody>
+                </table>
               </div>
             </div>
           </div>
@@ -1560,7 +1605,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.13';
+const SENTINEL_BUILD = '2026.06.14';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1728,6 +1773,7 @@ async function backendLogin(password) {
 }
 
 function finishWorkspaceUiAfterLoad() {
+  populateMapPjpAuditorSelect();
   updateFileChips();
   updateDualSummary();
   if (STATE.attendanceFileName) $('upload-zone-attendance')?.classList.add('loaded');
@@ -1737,6 +1783,8 @@ function finishWorkspaceUiAfterLoad() {
     refreshDashboard();
   } else if (STATE.pjpFileName && (STATE.planRows.length || STATE.planRowCount)) {
     showLoadedState();
+    renderMap();
+    renderMapPjpPanel();
   }
   if (STATE.currentView === 'expense') renderExpenseView();
 }
@@ -2009,6 +2057,9 @@ const STATE = {
   map: null,
   markers: [],
   lines: [],
+  mapPjpMarkers: [],
+  mapPjpLines: [],
+  mapPjpSelectedAuditor: '',
 
   // Roster map state (separate from main map)
   rosterMap: null,
@@ -2694,7 +2745,12 @@ $('date-filter').addEventListener('change', (e) => {
 });
 
 function refreshDashboard() {
-  if (!STATE.rawRows.length) return;
+  populateMapPjpAuditorSelect();
+  if (!STATE.rawRows.length) {
+    renderMap();
+    renderMapPjpPanel();
+    return;
+  }
   // Filter rows by selected date AND by the PJP auditor universe (if PJP loaded).
   let rowsOnDate = STATE.rawRows.filter(r => r.date && dateKey(r.date) === STATE.filteredDate);
   if (STATE.pjpEmpCodes && STATE.pjpEmpCodes.size > 0) {
@@ -2707,6 +2763,7 @@ function refreshDashboard() {
   computeKPIs();
   renderFieldForceTable();
   renderMap();
+  renderMapPjpPanel();
   renderUnmatchedPanel();
   if (STATE.currentView === 'expense') renderExpenseView();
 }
@@ -2962,6 +3019,203 @@ function renderFieldForceTable() {
 });
 
 // =================================================================
+// MAP — PJP 30-day plan by auditor
+// =================================================================
+function getMapPlanWindowEnd() {
+  if (STATE.filteredDate) {
+    const d = new Date(STATE.filteredDate + 'T12:00:00');
+    if (!Number.isNaN(d.getTime())) return d;
+  }
+  if (STATE.pjpMaxDate) return new Date(STATE.pjpMaxDate);
+  return new Date();
+}
+
+/** Last 30 calendar days (inclusive) of PJP plan rows for one auditor. */
+function buildAuditorPlanDays(empCode, dayCount = 30) {
+  if (!empCode || !STATE.planRows.length) return [];
+  const end = getMapPlanWindowEnd();
+  const start = new Date(end);
+  start.setDate(start.getDate() - (dayCount - 1));
+  const days = [];
+  const cursor = new Date(start);
+  while (cursor <= end) {
+    const dKey = dateKey(cursor);
+    const plan = STATE.planByEmpDate[`${empCode}|${dKey}`] || null;
+    const toTown = plan?.toTown || null;
+    days.push({
+      dateKey: dKey,
+      dateLabel: cursor.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+      day: cursor.toLocaleDateString('en-IN', { weekday: 'short' }),
+      plan,
+      fromTown: plan?.fromTown || null,
+      plannedTown: toTown,
+      workType: plan?.workType || null,
+      kms: plan?.kms ?? null,
+      hotelStay: plan?.hotelStay ?? null,
+      plannedCoords: toTown ? resolveCityCoords(toTown) : null,
+    });
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return days;
+}
+
+function populateMapPjpAuditorSelect() {
+  const select = $('map-pjp-auditor');
+  if (!select) return;
+  const prev = STATE.mapPjpSelectedAuditor || select.value;
+  if (!STATE.planRows.length) {
+    select.disabled = true;
+    select.innerHTML = '<option value="">Upload PJP to see 30-day plan</option>';
+    STATE.mapPjpSelectedAuditor = '';
+    return;
+  }
+  const codes = STATE.pjpEmpCodes.size
+    ? [...STATE.pjpEmpCodes]
+    : [...new Set(STATE.planRows.map((p) => p.empCode).filter(Boolean))];
+  const auditors = codes
+    .map((code) => {
+      const m = AUDITOR_MASTER.find((a) => a.empCode === code);
+      return m || { empCode: code, name: code, cluster: '' };
+    })
+    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  select.disabled = false;
+  select.innerHTML =
+    '<option value="">— Select auditor (30-day PJP) —</option>' +
+    auditors
+      .map(
+        (a) =>
+          `<option value="${escapeHtml(a.empCode)}">${escapeHtml(a.name)} · ${escapeHtml(a.cluster || a.empCode)}</option>`
+      )
+      .join('');
+  if (prev && auditors.some((a) => a.empCode === prev)) select.value = prev;
+  STATE.mapPjpSelectedAuditor = select.value;
+}
+
+function clearMapPjpOverlay() {
+  if (!STATE.map) return;
+  STATE.mapPjpMarkers.forEach((m) => STATE.map.removeLayer(m));
+  STATE.mapPjpLines.forEach((l) => STATE.map.removeLayer(l));
+  STATE.mapPjpMarkers = [];
+  STATE.mapPjpLines = [];
+}
+
+function renderMapPjpOnMap(master, days) {
+  clearMapPjpOverlay();
+  if (!master || !days.length) return;
+  initMap();
+  const allBounds = [];
+  if (master.lat != null && master.lng != null) {
+    const baseMarker = L.circleMarker([master.lat, master.lng], {
+      radius: 8,
+      fillColor: 'transparent',
+      color: '#fbbf24',
+      weight: 2.5,
+      opacity: 1,
+      fillOpacity: 0,
+    }).addTo(STATE.map);
+    baseMarker.bindPopup(
+      `<div style="font-family:Inter,sans-serif"><strong>🏠 ${escapeHtml(master.name)}</strong><br>${escapeHtml(master.hometown || '')}</div>`
+    );
+    STATE.mapPjpMarkers.push(baseMarker);
+    allBounds.push([master.lat, master.lng]);
+  }
+  const path = [];
+  days.forEach((d) => {
+    if (!d.plannedCoords) return;
+    const m = L.circleMarker([d.plannedCoords.lat, d.plannedCoords.lng], {
+      radius: 5,
+      fillColor: '#a855f7',
+      color: '#0a0e1a',
+      weight: 1,
+      opacity: 1,
+      fillOpacity: 0.9,
+    }).addTo(STATE.map);
+    const route =
+      d.fromTown && d.plannedTown && d.fromTown !== d.plannedTown
+        ? `${escapeHtml(d.fromTown)} → ${escapeHtml(d.plannedTown)}`
+        : escapeHtml(d.plannedTown || '—');
+    m.bindPopup(`
+      <div style="font-family:Inter,sans-serif;min-width:200px">
+        <div style="font-weight:600;color:#0a0e1a">${escapeHtml(d.dateLabel)} (${escapeHtml(d.day)})</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px">📋 ${route}</div>
+        ${d.workType ? `<div style="font-size:11px;color:#6b7280">${escapeHtml(d.workType)}</div>` : ''}
+        ${d.kms != null ? `<div style="font-size:11px;color:#6b7280">${d.kms} km</div>` : ''}
+      </div>
+    `);
+    STATE.mapPjpMarkers.push(m);
+    const last = path[path.length - 1];
+    if (!last || last[0] !== d.plannedCoords.lat || last[1] !== d.plannedCoords.lng) {
+      path.push([d.plannedCoords.lat, d.plannedCoords.lng]);
+    }
+    allBounds.push([d.plannedCoords.lat, d.plannedCoords.lng]);
+  });
+  if (path.length > 1) {
+    const line = L.polyline(path, {
+      color: '#a855f7',
+      weight: 2,
+      opacity: 0.55,
+      dashArray: '6, 4',
+    }).addTo(STATE.map);
+    STATE.mapPjpLines.push(line);
+  }
+  if (allBounds.length) {
+    STATE.map.fitBounds(allBounds, { padding: [40, 40], maxZoom: 8 });
+  }
+}
+
+function renderMapPjpPanel() {
+  const section = $('map-pjp-section');
+  const tbody = $('map-pjp-tbody');
+  if (!section || !tbody) return;
+  const empCode = STATE.mapPjpSelectedAuditor;
+  if (!empCode || !STATE.planRows.length) {
+    section.classList.add('hidden');
+    clearMapPjpOverlay();
+    return;
+  }
+  const master = AUDITOR_MASTER.find((a) => a.empCode === empCode);
+  const days = buildAuditorPlanDays(empCode, 30);
+  const plannedCount = days.filter((d) => d.plannedTown).length;
+  const end = getMapPlanWindowEnd();
+  const start = new Date(end);
+  start.setDate(start.getDate() - 29);
+  const rangeLabel = `${start.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })} – ${end.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+
+  section.classList.remove('hidden');
+  $('map-pjp-title').textContent = master
+    ? `${master.name} — 30-day planned locations`
+    : `${empCode} — 30-day planned locations`;
+  $('map-pjp-sub').textContent = `${rangeLabel} · ${plannedCount} days with a planned town · purple markers on map`;
+
+  tbody.innerHTML = days
+    .map((d) => {
+      const hasPlan = !!(d.plannedTown || d.workType);
+      const hotel =
+        d.hotelStay === true ? 'Yes' : d.hotelStay === false ? 'No' : '—';
+      return `
+      <tr class="${hasPlan ? '' : 'text-dim'}">
+        <td>${escapeHtml(d.dateLabel)}</td>
+        <td>${escapeHtml(d.day)}</td>
+        <td>${escapeHtml(d.workType || '—')}</td>
+        <td>${escapeHtml(d.fromTown || '—')}</td>
+        <td><strong>${escapeHtml(d.plannedTown || '—')}</strong></td>
+        <td>${d.kms != null ? escapeHtml(String(d.kms)) : '—'}</td>
+        <td>${hotel}</td>
+      </tr>
+    `;
+    })
+    .join('');
+
+  renderMapPjpOnMap(master, days);
+}
+
+$('map-pjp-auditor')?.addEventListener('change', () => {
+  STATE.mapPjpSelectedAuditor = $('map-pjp-auditor').value;
+  renderMap();
+  renderMapPjpPanel();
+});
+
+// =================================================================
 // MAP
 // =================================================================
 function initMap() {
@@ -2976,6 +3230,7 @@ function initMap() {
 
 function renderMap() {
   initMap();
+  clearMapPjpOverlay();
   // Clear previous markers and lines
   if (STATE.markers.length) {
     STATE.markers.forEach(m => STATE.map.removeLayer(m));
@@ -3064,7 +3319,10 @@ function renderMap() {
     }
   });
 
-  if (allPoints.length) {
+  if (STATE.mapPjpSelectedAuditor && STATE.planRows.length) {
+    const master = AUDITOR_MASTER.find((a) => a.empCode === STATE.mapPjpSelectedAuditor);
+    renderMapPjpOnMap(master, buildAuditorPlanDays(STATE.mapPjpSelectedAuditor, 30));
+  } else if (allPoints.length) {
     const group = L.featureGroup(STATE.markers);
     STATE.map.fitBounds(group.getBounds().pad(0.15), { maxZoom: 7 });
   }
