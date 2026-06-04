@@ -3,6 +3,7 @@ require('dotenv').config();
 const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
+const compression = require('compression');
 const cors = require('cors');
 const multer = require('multer');
 const session = require('express-session');
@@ -18,6 +19,7 @@ const {
   extractBillsFromBulkPdfBuffer,
   buildClaimFromExtractedBill,
   MAX_PDF_BYTES,
+  slimClaimForClient,
 } = require('./lib/bulk-pdf');
 const {
   createBulkPdfJob,
@@ -118,6 +120,7 @@ async function runBulkPdfJob(jobId, { sessionId, apiKey, fileBuffer, fileName })
 const app = express();
 app.set('trust proxy', 1);
 
+app.use(compression());
 app.use(cookieParser());
 app.use(
   cors({
@@ -252,7 +255,75 @@ function buildStatePayload(workspace, filteredDate) {
     pjpMaxDate: workspace.pjpMaxDate,
     pjpEmpCodes: workspace.pjpEmpCodes,
     filteredDate: defaultDate,
-    claims: workspace.claims,
+    claims: workspace.claims.map(slimClaimForClient),
+    aiKeySource: process.env.ANTHROPIC_API_KEY ? 'server' : 'browser',
+    hasServerApiKey: !!process.env.ANTHROPIC_API_KEY,
+    authRequired: false,
+  };
+}
+
+/** Lightweight state — no attendance/PJP row blobs (fetch via /api/attendance and /api/pjp). */
+async function loadStateSummary(sessionId) {
+  await ensureSession(sessionId);
+  const pool = getPool();
+
+  const [att, pjp, claimsRes] = await Promise.all([
+    pool.query(
+      `SELECT filename,
+        CASE WHEN rows IS NULL THEN 0 ELSE jsonb_array_length(rows) END AS row_count
+       FROM attendance_snapshots WHERE session_id = $1`,
+      [sessionId]
+    ),
+    pool.query(
+      `SELECT filename, meta,
+        CASE WHEN plan_rows IS NULL THEN 0 ELSE jsonb_array_length(plan_rows) END AS plan_row_count
+       FROM pjp_snapshots WHERE session_id = $1`,
+      [sessionId]
+    ),
+    pool.query(
+      'SELECT payload FROM claims WHERE session_id = $1 ORDER BY created_at DESC',
+      [sessionId]
+    ),
+  ]);
+
+  const meta = pjp.rows[0]?.meta || {};
+  const rawRowCount = Number(att.rows[0]?.row_count) || 0;
+  const planRowCount = Number(pjp.rows[0]?.plan_row_count) || 0;
+
+  return {
+    attendanceFileName: att.rows[0]?.filename || null,
+    attendanceRowCount: rawRowCount,
+    pjpFileName: pjp.rows[0]?.filename || null,
+    planRowCount,
+    pjpMonth: meta.pjpMonth || null,
+    pjpMinDate: meta.pjpMinDate || null,
+    pjpMaxDate: meta.pjpMaxDate || null,
+    pjpEmpCodes: meta.pjpEmpCodes || [],
+    claims: claimsRes.rows.map((r) => slimClaimForClient(r.payload)),
+    _hasAttendance: rawRowCount > 0,
+    _hasPjp: planRowCount > 0,
+  };
+}
+
+function buildStateSummaryPayload(summary, filteredDate) {
+  let defaultDate =
+    filteredDate || pickDefaultDate([], summary.pjpMinDate, summary.pjpMaxDate);
+  if (!defaultDate) defaultDate = dateKey(new Date());
+
+  return {
+    sessionId: null,
+    attendanceFileName: summary.attendanceFileName,
+    attendanceRowCount: summary.attendanceRowCount,
+    pjpFileName: summary.pjpFileName,
+    planRowCount: summary.planRowCount,
+    pjpMonth: summary.pjpMonth,
+    pjpMinDate: summary.pjpMinDate,
+    pjpMaxDate: summary.pjpMaxDate,
+    pjpEmpCodes: summary.pjpEmpCodes,
+    filteredDate: defaultDate,
+    claims: summary.claims,
+    hasAttendance: summary._hasAttendance,
+    hasPjp: summary._hasPjp,
     aiKeySource: process.env.ANTHROPIC_API_KEY ? 'server' : 'browser',
     hasServerApiKey: !!process.env.ANTHROPIC_API_KEY,
     authRequired: false,
@@ -262,7 +333,7 @@ function buildStatePayload(workspace, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.9-main2' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.10-main2' });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -315,13 +386,89 @@ app.get('/api/state', authRequired, async (req, res) => {
     if (!sessionId) {
       sessionId = crypto.randomUUID();
       await ensureSession(sessionId);
-      return res.json({ ...buildStatePayload(await loadWorkspace(sessionId), null), sessionId });
+      return res.json({
+        ...buildStateSummaryPayload(
+          {
+            attendanceFileName: null,
+            attendanceRowCount: 0,
+            pjpFileName: null,
+            planRowCount: 0,
+            pjpMonth: null,
+            pjpMinDate: null,
+            pjpMaxDate: null,
+            pjpEmpCodes: [],
+            claims: [],
+            _hasAttendance: false,
+            _hasPjp: false,
+          },
+          null
+        ),
+        sessionId,
+      });
     }
-    const workspace = await loadWorkspace(sessionId);
-    res.json({ ...buildStatePayload(workspace, req.query.filteredDate || null), sessionId });
+    const summary = await loadStateSummary(sessionId);
+    res.json({
+      ...buildStateSummaryPayload(summary, req.query.filteredDate || null),
+      sessionId,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Failed to load state' });
+  }
+});
+
+app.get('/api/attendance', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const { rows } = await getPool().query(
+      'SELECT filename, rows FROM attendance_snapshots WHERE session_id = $1',
+      [sessionId]
+    );
+    if (!rows.length) return res.json({ attendanceFileName: null, rawRows: [], uniqueAuditors: [] });
+    const rawRows = rows[0].rows || [];
+    const uniqueAuditors = [...new Set(rawRows.map((r) => r.auditor).filter(Boolean))].sort();
+    res.json({
+      attendanceFileName: rows[0].filename,
+      rawRows,
+      uniqueAuditors,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Failed to load attendance' });
+  }
+});
+
+app.get('/api/pjp', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const { rows } = await getPool().query(
+      'SELECT filename, plan_rows, meta FROM pjp_snapshots WHERE session_id = $1',
+      [sessionId]
+    );
+    if (!rows.length) {
+      return res.json({
+        pjpFileName: null,
+        planRows: [],
+        pjpMonth: null,
+        pjpMinDate: null,
+        pjpMaxDate: null,
+        pjpEmpCodes: [],
+      });
+    }
+    const meta = rows[0].meta || {};
+    res.json({
+      pjpFileName: rows[0].filename,
+      planRows: rows[0].plan_rows || [],
+      pjpMonth: meta.pjpMonth || null,
+      pjpMinDate: meta.pjpMinDate || null,
+      pjpMaxDate: meta.pjpMaxDate || null,
+      pjpEmpCodes: meta.pjpEmpCodes || [],
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Failed to load PJP' });
   }
 });
 

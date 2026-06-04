@@ -1560,7 +1560,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.9';
+const SENTINEL_BUILD = '2026.06.10';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1635,20 +1635,50 @@ function rebuildPlanIndexesFromRows(planRows) {
   return { planByEmpDate, planByNameDate };
 }
 
-function applyStateFromServer(data) {
-  if (data.sessionId) localStorage.setItem(SESSION_STORAGE_KEY, data.sessionId);
-  STATE.rawRows = (data.rawRows || []).map(r => ({ ...r, date: r.date ? new Date(r.date) : null }));
-  STATE.planRows = (data.planRows || []).map(p => ({ ...p, date: p.date ? new Date(p.date) : null }));
-  STATE.uniqueAuditors = data.uniqueAuditors || [...new Set(STATE.rawRows.map(r => r.auditor).filter(Boolean))].sort();
+function applyAttendanceFromServer(data) {
   STATE.attendanceFileName = data.attendanceFileName || null;
+  STATE.rawRows = (data.rawRows || []).map(r => ({ ...r, date: r.date ? new Date(r.date) : null }));
+  STATE.uniqueAuditors = data.uniqueAuditors || [...new Set(STATE.rawRows.map(r => r.auditor).filter(Boolean))].sort();
+  STATE.attendanceRowCount = STATE.rawRows.length;
+}
+
+function applyPjpFromServer(data) {
   STATE.pjpFileName = data.pjpFileName || null;
+  STATE.planRows = (data.planRows || []).map(p => ({ ...p, date: p.date ? new Date(p.date) : null }));
   STATE.pjpMonth = data.pjpMonth || null;
   STATE.pjpMinDate = data.pjpMinDate ? new Date(data.pjpMinDate) : null;
   STATE.pjpMaxDate = data.pjpMaxDate ? new Date(data.pjpMaxDate) : null;
   STATE.pjpEmpCodes = new Set(data.pjpEmpCodes || []);
+  STATE.planRowCount = STATE.planRows.length;
   const planIdx = rebuildPlanIndexesFromRows(STATE.planRows);
   STATE.planByEmpDate = planIdx.planByEmpDate;
   STATE.planByNameDate = planIdx.planByNameDate;
+}
+
+function applyStateFromServer(data) {
+  if (data.sessionId) localStorage.setItem(SESSION_STORAGE_KEY, data.sessionId);
+  if (data.rawRows?.length) {
+    applyAttendanceFromServer(data);
+  } else {
+    STATE.rawRows = [];
+    STATE.attendanceFileName = data.attendanceFileName || null;
+    STATE.attendanceRowCount = data.attendanceRowCount || 0;
+    if (data.uniqueAuditors) STATE.uniqueAuditors = data.uniqueAuditors;
+  }
+  if (data.planRows?.length) {
+    applyPjpFromServer(data);
+  } else {
+    STATE.planRows = [];
+    STATE.planRowCount = data.planRowCount || 0;
+    STATE.pjpFileName = data.pjpFileName || null;
+    STATE.pjpMonth = data.pjpMonth || null;
+    STATE.pjpMinDate = data.pjpMinDate ? new Date(data.pjpMinDate) : null;
+    STATE.pjpMaxDate = data.pjpMaxDate ? new Date(data.pjpMaxDate) : null;
+    STATE.pjpEmpCodes = new Set(data.pjpEmpCodes || []);
+    const planIdx = rebuildPlanIndexesFromRows(STATE.planRows);
+    STATE.planByEmpDate = planIdx.planByEmpDate;
+    STATE.planByNameDate = planIdx.planByNameDate;
+  }
   STATE.filteredDate = data.filteredDate || null;
   STATE.claims = (data.claims || []).map(c => ({
     ...c,
@@ -1657,6 +1687,18 @@ function applyStateFromServer(data) {
   if (STATE.filteredDate) $('date-filter').value = STATE.filteredDate;
   if (STATE.pjpMinDate) $('date-filter').min = dateKey(STATE.pjpMinDate);
   if (STATE.pjpMaxDate) $('date-filter').max = dateKey(STATE.pjpMaxDate);
+}
+
+async function loadAttendanceFromBackend() {
+  const resp = await apiFetch('/api/attendance');
+  if (!resp.ok) throw new Error('Failed to load attendance data');
+  applyAttendanceFromServer(await resp.json());
+}
+
+async function loadPjpFromBackend() {
+  const resp = await apiFetch('/api/pjp');
+  if (!resp.ok) throw new Error('Failed to load PJP data');
+  applyPjpFromServer(await resp.json());
 }
 
 function showLoginGate(show) {
@@ -1686,6 +1728,20 @@ async function loadStateFromBackend() {
   if (!resp.ok) throw new Error('Failed to load saved data');
   const data = await resp.json();
   applyStateFromServer(data);
+  if (data.hasAttendance && !(data.rawRows?.length)) {
+    try {
+      await loadAttendanceFromBackend();
+    } catch (err) {
+      console.warn('Attendance load:', err);
+    }
+  }
+  if (data.hasPjp && !(data.planRows?.length)) {
+    try {
+      await loadPjpFromBackend();
+    } catch (err) {
+      console.warn('PJP load:', err);
+    }
+  }
   updateFileChips();
   updateDualSummary();
   if (STATE.attendanceFileName) $('upload-zone-attendance')?.classList.add('loaded');
@@ -1693,6 +1749,8 @@ async function loadStateFromBackend() {
   if (STATE.rawRows.length) {
     showLoadedState();
     refreshDashboard();
+  } else if (STATE.pjpFileName && STATE.planRows.length) {
+    showLoadedState();
   }
   if (STATE.currentView === 'expense') renderExpenseView();
 }
@@ -2449,14 +2507,16 @@ function parseYesNo(v) {
 function updateFileChips() {
   if (STATE.attendanceFileName) {
     $('chip-attendance').classList.add('loaded');
-    $('chip-attendance-status').textContent = `${STATE.rawRows.length} rows`;
+    const attN = STATE.rawRows.length || STATE.attendanceRowCount || 0;
+    $('chip-attendance-status').textContent = `${attN} rows`;
   } else {
     $('chip-attendance').classList.remove('loaded');
     $('chip-attendance-status').textContent = 'Not loaded';
   }
   if (STATE.pjpFileName) {
     $('chip-pjp').classList.add('loaded');
-    $('chip-pjp-status').textContent = `${STATE.planRows.length} plan rows`;
+    const pjpN = STATE.planRows.length || STATE.planRowCount || 0;
+    $('chip-pjp-status').textContent = `${pjpN} plan rows`;
     // Also mark the upload-zone as loaded if visible
     $('upload-zone-pjp')?.classList.add('loaded');
   } else {
