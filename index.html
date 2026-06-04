@@ -358,26 +358,6 @@ html, body {
 /* ===== MAP ===== */
 .map-wrap { height: 480px; position: relative; }
 #map { height: 100%; width: 100%; background: var(--bg-2); }
-.map-pjp-section {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border);
-}
-.map-pjp-section.hidden { display: none; }
-.map-pjp-table-wrap {
-  max-height: 320px;
-  overflow: auto;
-  margin-top: 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-}
-.map-pjp-table-wrap .table { margin: 0; }
-.map-pjp-table-wrap .table th {
-  position: sticky;
-  top: 0;
-  background: var(--bg-2);
-  z-index: 1;
-}
 .legend-dot.dot-plan { background: #a855f7; }
 .map-legend {
   position: absolute;
@@ -969,28 +949,7 @@ html, body {
                 <div class="legend-item"><span class="legend-dot dot-absent"></span> Absent (current)</div>
                 <div class="legend-item"><span class="legend-dot dot-base"></span> Home Base</div>
                 <div class="legend-item"><span class="legend-dot dot-plan"></span> Market Visit (PJP)</div>
-                <div class="legend-item"><span class="legend-line"></span> Base → Current / Plan path</div>
-              </div>
-            </div>
-            <div id="map-pjp-section" class="map-pjp-section hidden">
-              <div class="panel-title" id="map-pjp-title" style="font-size:14px">PJP Market Visits</div>
-              <div class="panel-sub" id="map-pjp-sub">One map point per Market Visit (Work Type column)</div>
-              <div class="map-pjp-table-wrap">
-                <table class="table" id="map-pjp-table">
-                  <thead>
-                    <tr>
-                      <th>Date</th>
-                      <th>Day</th>
-                      <th>Work type</th>
-                      <th>From</th>
-                      <th>To (planned)</th>
-                      <th>Kms</th>
-                      <th>Hotel</th>
-                      <th>Map</th>
-                    </tr>
-                  </thead>
-                  <tbody id="map-pjp-tbody"></tbody>
-                </table>
+                <div class="legend-item"><span class="legend-line"></span> Base → Current</div>
               </div>
             </div>
           </div>
@@ -1606,7 +1565,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.16';
+const SENTINEL_BUILD = '2026.06.17';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -2183,6 +2142,20 @@ const CITY_GEO = {
   'mumbai': [19.0760, 72.8777],
   'delhi': [28.7041, 77.1025],
   'hyderabad': [17.3850, 78.4867],
+  'secunderabad': [17.4399, 78.4983],
+  'nalgonda': [17.0575, 79.2707],
+  'miryalaguda': [16.8722, 79.5625],
+  'warangal': [17.9689, 79.5941],
+  'karimnagar': [18.4386, 79.1288],
+  'khammam': [17.2473, 80.1514],
+  'mahbubnagar': [16.7488, 77.9854],
+  'sangareddy': [17.6245, 78.0867],
+  'siddipet': [18.1018, 78.8520],
+  'ramagundam': [18.7550, 79.4740],
+  'adilabad': [19.6641, 78.5320],
+  'medak': [18.0480, 78.2628],
+  'bhongir': [17.5155, 78.8859],
+  'bilaspur': [22.0797, 82.1409],
   'pune': [18.5204, 73.8567],
   'ahmedabad': [23.0225, 72.5714],
   'kochi': [9.9312, 76.2673],
@@ -2393,15 +2366,35 @@ const CITY_GEO = {
   'etawah': [26.7855, 79.0150],
 };
 
-// Try to resolve "base location" name → lat/lng using fuzzy lookup
+function normalizeCityKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9 ]/g, '');
+}
+
+/** Exact / token lookup only — avoids "Nalgonda" matching "Gonda" (UP). */
 function resolveCityCoords(name) {
   if (!name) return null;
-  const k = String(name).toLowerCase().trim();
-  if (CITY_GEO[k]) return { lat: CITY_GEO[k][0], lng: CITY_GEO[k][1], name };
-  // Try fuzzy match on keys
-  for (const key in CITY_GEO) {
-    if (k.includes(key) || key.includes(k)) {
-      return { lat: CITY_GEO[key][0], lng: CITY_GEO[key][1], name };
+  const raw = String(name).trim();
+  const compact = normalizeCityKey(raw).replace(/\s/g, '');
+  if (CITY_GEO[compact]) {
+    return { lat: CITY_GEO[compact][0], lng: CITY_GEO[compact][1], name: raw };
+  }
+  const spaced = normalizeCityKey(raw);
+  if (CITY_GEO[spaced]) {
+    return { lat: CITY_GEO[spaced][0], lng: CITY_GEO[spaced][1], name: raw };
+  }
+  const tokens = raw
+    .toLowerCase()
+    .split(/[\s,/()\-]+/)
+    .map((t) => normalizeCityKey(t).replace(/\s/g, ''))
+    .filter((t) => t.length >= 3)
+    .sort((a, b) => b.length - a.length);
+  for (const t of tokens) {
+    if (CITY_GEO[t]) {
+      return { lat: CITY_GEO[t][0], lng: CITY_GEO[t][1], name: raw };
     }
   }
   return null;
@@ -2977,7 +2970,9 @@ function computeKPIs() {
     scopeNote = ` · attendance scoped to ${STATE.pjpMonth.label} (${STATE.rawRows.length}/${STATE.attendanceRowCountTotal} rows)`;
   }
   $('page-meta').textContent = `${dateStr} · ${universe} · ${STATE.pjpMonth ? STATE.pjpMonth.label + ' PJP month' : 'all dates'}${scopeNote}`;
-  $('map-sub').textContent = `${present.length} auditors on field · ${absent.length} absent${notSubmitted ? ` · ${notSubmitted} no submission` : ''}`;
+  if (!STATE.mapPjpSelectedAuditor) {
+    $('map-sub').textContent = `${present.length} auditors on field · ${absent.length} absent${notSubmitted > 0 ? ` · ${notSubmitted} no submission` : ''}`;
+  }
   $('ff-sub').textContent = `${rows.length} of ${total} ${pjpSize ? 'PJP' : ''} auditors reported for ${dateStr}`;
 }
 
@@ -3097,10 +3092,11 @@ function isMarketVisitWorkType(workType) {
   return workType && /market\s*visit/i.test(String(workType).trim());
 }
 
+/** Market Visit marker = planned destination (To Town), else From Town. */
 function resolvePlanVisitCoords(plan) {
   if (!plan) return null;
-  for (const town of [plan.toTown, plan.fromTown]) {
-    if (!town) continue;
+  const towns = [plan.toTown, plan.fromTown].filter(Boolean);
+  for (const town of towns) {
     const c = resolveCityCoords(town);
     if (c) return { ...c, town };
   }
@@ -3211,7 +3207,7 @@ function populateMapPjpAuditorSelect() {
     : [...new Set(STATE.planRows.map((p) => p.empCode).filter(Boolean))];
   const auditors = codes
     .map((code) => {
-      const m = AUDITOR_MASTER.find((a) => a.empCode === code);
+      const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(code));
       return m || { empCode: code, name: code, cluster: '' };
     })
     .sort((a, b) => String(a.name).localeCompare(String(b.name)));
@@ -3256,7 +3252,6 @@ function renderMapPjpOnMap(master, marketVisits) {
     STATE.mapPjpMarkers.push(baseMarker);
     allBounds.push([master.lat, master.lng]);
   }
-  const path = [];
   marketVisits.forEach((d, idx) => {
     if (!d.plannedCoords) return;
     const m = L.circleMarker([d.plannedCoords.lat, d.plannedCoords.lng], {
@@ -3271,40 +3266,38 @@ function renderMapPjpOnMap(master, marketVisits) {
       d.fromTown && d.plannedTown && d.fromTown !== d.plannedTown
         ? `${escapeHtml(d.fromTown)} → ${escapeHtml(d.plannedTown)}`
         : escapeHtml(d.plannedTown || d.fromTown || '—');
+    const geoName = d.plannedCoords.town || d.plannedTown || d.fromTown || '';
     m.bindPopup(`
       <div style="font-family:Inter,sans-serif;min-width:200px">
         <div style="font-weight:600;color:#0a0e1a">Market Visit #${idx + 1} · ${escapeHtml(d.dateLabel)}</div>
         <div style="font-size:10px;color:#9ca3af">${escapeHtml(d.day)}</div>
-        <div style="font-size:11px;color:#6b7280;margin-top:4px">📋 ${route}</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:4px">📍 ${escapeHtml(geoName)}</div>
+        <div style="font-size:11px;color:#6b7280">📋 ${route}</div>
         ${d.kms != null ? `<div style="font-size:11px;color:#6b7280">${d.kms} km</div>` : ''}
       </div>
     `);
     STATE.mapPjpMarkers.push(m);
-    path.push([d.plannedCoords.lat, d.plannedCoords.lng]);
     allBounds.push([d.plannedCoords.lat, d.plannedCoords.lng]);
   });
-  if (path.length > 1) {
-    const line = L.polyline(path, {
-      color: '#a855f7',
-      weight: 2,
-      opacity: 0.45,
-      dashArray: '6, 4',
-    }).addTo(STATE.map);
-    STATE.mapPjpLines.push(line);
-  }
   if (allBounds.length) {
     STATE.map.fitBounds(allBounds, { padding: [40, 40], maxZoom: 8 });
   }
 }
 
+function setDefaultMapSub() {
+  if (STATE.mapPjpSelectedAuditor) return;
+  const rows = STATE.dateFiltered || [];
+  const present = rows.filter((r) => r.onField);
+  const absent = rows.filter((r) => !r.onField);
+  const notSubmitted = (STATE.pjpEmpCodes?.size || 0) - rows.length;
+  $('map-sub').textContent = `${present.length} auditors on field · ${absent.length} absent${notSubmitted > 0 ? ` · ${notSubmitted} no submission` : ''}`;
+}
+
 function renderMapPjpPanel() {
-  const section = $('map-pjp-section');
-  const tbody = $('map-pjp-tbody');
-  if (!section || !tbody) return;
   const empCode = STATE.mapPjpSelectedAuditor;
   if (!empCode || !STATE.planRows.length) {
-    section.classList.add('hidden');
     clearMapPjpOverlay();
+    setDefaultMapSub();
     return;
   }
   const master = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(empCode));
@@ -3312,46 +3305,14 @@ function renderMapPjpPanel() {
   const marketVisitTotal = marketVisits.length;
   const onMap = marketVisits.filter((d) => d.plannedCoords).length;
   const missingGeo = marketVisitTotal - onMap;
-  const rangeLabel = STATE.pjpMonth
-    ? STATE.pjpMonth.label
-    : STATE.pjpMinDate && STATE.pjpMaxDate
-      ? `${dateKey(STATE.pjpMinDate)} – ${dateKey(STATE.pjpMaxDate)}`
-      : 'PJP month';
-
-  section.classList.remove('hidden');
-  $('map-pjp-title').textContent = master
-    ? `${master.name} — ${marketVisitTotal} Market Visit${marketVisitTotal === 1 ? '' : 's'}`
-    : `${empCode} — ${marketVisitTotal} Market Visits`;
-  let sub = `${rangeLabel} · ${onMap} point${onMap === 1 ? '' : 's'} on map (= Market Visit count from Work Type)`;
+  const rangeLabel = STATE.pjpMonth ? STATE.pjpMonth.label : 'PJP month';
+  const who = master ? master.name : empCode;
+  let sub = `${who} · ${onMap} Market Visit point${onMap === 1 ? '' : 's'} on map (${marketVisitTotal} in ${rangeLabel})`;
   if (missingGeo > 0) {
-    sub += ` · ${missingGeo} visit${missingGeo === 1 ? '' : 's'} missing town coordinates`;
+    const missing = marketVisits.filter((d) => !d.plannedCoords).map((d) => d.plannedTown || d.fromTown).filter(Boolean);
+    sub += ` · ${missingGeo} not mapped: ${[...new Set(missing)].slice(0, 3).join(', ')}${missing.length > 3 ? '…' : ''}`;
   }
-  $('map-pjp-sub').textContent = sub;
-
-  tbody.innerHTML = marketVisits.length
-    ? marketVisits
-        .map((d, i) => {
-          const hotel =
-            d.hotelStay === true ? 'Yes' : d.hotelStay === false ? 'No' : '—';
-          const mapOk = d.plannedCoords
-            ? '<span class="pill pill-on">On map</span>'
-            : '<span class="pill pill-off">No coords</span>';
-          return `
-      <tr>
-        <td>${escapeHtml(d.dateLabel)}</td>
-        <td>${escapeHtml(d.day)}</td>
-        <td><strong>${escapeHtml(d.workType || 'Market Visit')}</strong></td>
-        <td>${escapeHtml(d.fromTown || '—')}</td>
-        <td><strong>${escapeHtml(d.plannedTown || d.fromTown || '—')}</strong></td>
-        <td>${d.kms != null ? escapeHtml(String(d.kms)) : '—'}</td>
-        <td>${hotel}</td>
-        <td>${mapOk}</td>
-      </tr>
-    `;
-        })
-        .join('')
-    : `<tr><td colspan="8" class="table-empty">No Market Visit rows for this auditor in ${escapeHtml(rangeLabel)}.</td></tr>`;
-
+  $('map-sub').textContent = sub;
   renderMapPjpOnMap(master, marketVisits);
 }
 
@@ -3466,7 +3427,9 @@ function renderMap() {
   });
 
   if (STATE.mapPjpSelectedAuditor && STATE.planRows.length) {
-    const master = AUDITOR_MASTER.find((a) => a.empCode === STATE.mapPjpSelectedAuditor);
+    const master = AUDITOR_MASTER.find(
+      (a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(STATE.mapPjpSelectedAuditor)
+    );
     renderMapPjpOnMap(master, buildAuditorMarketVisits(STATE.mapPjpSelectedAuditor));
   } else if (allPoints.length) {
     const group = L.featureGroup(STATE.markers);

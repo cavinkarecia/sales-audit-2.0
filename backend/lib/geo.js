@@ -20,6 +20,11 @@ const CITY_GEO = {
   mumbai: [19.076, 72.8777],
   delhi: [28.7041, 77.1025],
   hyderabad: [17.385, 78.4867],
+  secunderabad: [17.4399, 78.4983],
+  nalgonda: [17.0575, 79.2707],
+  miryalaguda: [16.8722, 79.5625],
+  warangal: [17.9689, 79.5941],
+  gonda: [27.1335, 81.9619],
   pune: [18.5204, 73.8567],
   ahmedabad: [23.0225, 72.5714],
   kochi: [9.9312, 76.2673],
@@ -93,12 +98,30 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
+function normalizeCityKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, ' ')
+    .replace(/[^a-z0-9 ]/g, '');
+}
+
+/** Exact / token lookup only — avoids "Nalgonda" matching "Gonda" (UP). */
 function resolveCityCoords(name) {
   if (!name) return null;
-  const key = String(name).toLowerCase().replace(/[^a-z0-9]/g, '');
-  for (const [city, coords] of Object.entries(CITY_GEO)) {
-    const ck = city.replace(/[^a-z0-9]/g, '');
-    if (key.includes(ck) || ck.includes(key)) return { lat: coords[0], lng: coords[1] };
+  const raw = String(name).trim();
+  const compact = normalizeCityKey(raw).replace(/\s/g, '');
+  if (CITY_GEO[compact]) return { lat: CITY_GEO[compact][0], lng: CITY_GEO[compact][1] };
+  const spaced = normalizeCityKey(raw);
+  if (CITY_GEO[spaced]) return { lat: CITY_GEO[spaced][0], lng: CITY_GEO[spaced][1] };
+  const tokens = raw
+    .toLowerCase()
+    .split(/[\s,/()\-]+/)
+    .map((t) => normalizeCityKey(t).replace(/\s/g, ''))
+    .filter((t) => t.length >= 3)
+    .sort((a, b) => b.length - a.length);
+  for (const t of tokens) {
+    if (CITY_GEO[t]) return { lat: CITY_GEO[t][0], lng: CITY_GEO[t][1] };
   }
   return null;
 }
