@@ -1633,7 +1633,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.19';
+const SENTINEL_BUILD = '2026.06.20';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1699,14 +1699,20 @@ async function ensureBackendSession() {
 function rebuildPlanIndexesFromRows(planRows) {
   const planByEmpDate = {};
   const planByNameDate = {};
+  const pjpEmpCodes = new Set();
   for (const plan of planRows || []) {
     const dk = plan.dateKey || (plan.date ? dateKey(new Date(plan.date)) : null);
     if (!dk) continue;
-    const ec = normalizeEmpCode(plan.empCode);
-    if (ec) planByEmpDate[`${ec}|${dk}`] = plan;
+    if (plan.empCode) plan.empCode = normalizeEmpCode(plan.empCode);
+    const ec = plan.empCode || resolvePlanEmpCode(plan);
+    if (ec) {
+      plan.empCode = ec;
+      planByEmpDate[`${ec}|${dk}`] = plan;
+      pjpEmpCodes.add(ec);
+    }
     if (plan.empName) planByNameDate[`${normalizeName(plan.empName)}|${dk}`] = plan;
   }
-  return { planByEmpDate, planByNameDate };
+  return { planByEmpDate, planByNameDate, pjpEmpCodes };
 }
 
 function filterAttendanceToPjpMonth(rows) {
@@ -1758,11 +1764,13 @@ function applyPjpFromServer(data) {
   STATE.pjpMonth = data.pjpMonth || null;
   STATE.pjpMinDate = data.pjpMinDate ? new Date(data.pjpMinDate) : null;
   STATE.pjpMaxDate = data.pjpMaxDate ? new Date(data.pjpMaxDate) : null;
-  STATE.pjpEmpCodes = new Set(data.pjpEmpCodes || []);
   STATE.planRowCount = STATE.planRows.length;
   const planIdx = rebuildPlanIndexesFromRows(STATE.planRows);
   STATE.planByEmpDate = planIdx.planByEmpDate;
   STATE.planByNameDate = planIdx.planByNameDate;
+  STATE.pjpEmpCodes = planIdx.pjpEmpCodes.size
+    ? planIdx.pjpEmpCodes
+    : new Set((data.pjpEmpCodes || []).map((c) => normalizeEmpCode(c)));
   if (STATE.rawRowsAll.length || STATE.attendanceFileName) {
     applyPjpAttendanceScope();
   }
@@ -1787,10 +1795,12 @@ function applyStateFromServer(data) {
     STATE.pjpMonth = data.pjpMonth || null;
     STATE.pjpMinDate = data.pjpMinDate ? new Date(data.pjpMinDate) : null;
     STATE.pjpMaxDate = data.pjpMaxDate ? new Date(data.pjpMaxDate) : null;
-    STATE.pjpEmpCodes = new Set(data.pjpEmpCodes || []);
     const planIdx = rebuildPlanIndexesFromRows(STATE.planRows);
     STATE.planByEmpDate = planIdx.planByEmpDate;
     STATE.planByNameDate = planIdx.planByNameDate;
+    STATE.pjpEmpCodes = planIdx.pjpEmpCodes.size
+      ? planIdx.pjpEmpCodes
+      : new Set((data.pjpEmpCodes || []).map((c) => normalizeEmpCode(c)));
   }
   STATE.filteredDate = data.filteredDate || null;
   if (data.claims) {
@@ -2185,7 +2195,12 @@ function parseExcelDate(v) {
 }
 function dateKey(d) {
   if (!d) return null;
-  return d.toISOString().slice(0, 10);
+  const x = d instanceof Date ? d : new Date(d);
+  if (isNaN(x.getTime())) return null;
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, '0');
+  const day = String(x.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 function escapeHtml(s) {
   if (s == null) return '';
@@ -2598,9 +2613,10 @@ async function handleFile(file, kind) {
         for (const r of rows) {
           const plan = normalizePlanRow(r, sheetName);
           if (!plan.date || (!plan.empCode && !plan.empName)) continue;
+          if (plan.empCode) plan.empCode = normalizeEmpCode(plan.empCode);
           STATE.planRows.push(plan);
           if (plan.empCode) {
-            STATE.planByEmpDate[`${normalizeEmpCode(plan.empCode)}|${plan.dateKey}`] = plan;
+            STATE.planByEmpDate[`${plan.empCode}|${plan.dateKey}`] = plan;
             STATE.pjpEmpCodes.add(plan.empCode);
           }
           if (plan.empName) {
@@ -3259,22 +3275,61 @@ function isTravelingAuditor(attRow, plan) {
   return false;
 }
 
-/** Market Visit rows in the next N days from the selected date (Col H = toTown). */
-function buildUpcomingMarketVisitMarkers(fromDate, days = UPCOMING_PJP_DAYS, empCodeFilter = null) {
-  if (!STATE.planRows.length || !fromDate) return [];
-  const start = fromDate instanceof Date ? fromDate : new Date(fromDate);
-  const startKey = dateKey(start);
+function planMatchesFocusAuditor(plan, empCodeFilter) {
+  if (!empCodeFilter) return true;
+  const focusEc = normalizeEmpCode(empCodeFilter);
+  const planEc = normalizeEmpCode(plan.empCode);
+  if (planEc && planEc === focusEc) return true;
+  const master = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === focusEc);
+  if (!master) return planEc === focusEc;
+  const planTokens = tokenizeName(plan.empName || plan.sheet || '');
+  const masterTokens = tokenizeName(master.name);
+  if (planTokens.length && planTokens.every((t) => masterTokens.includes(t))) return true;
+  if (planTokens.length && masterTokens.some((t) => planTokens.includes(t))) return true;
+  const sheetNorm = normalizeName(plan.sheet || '');
+  const masterNorm = normalizeName(master.name);
+  return sheetNorm.length >= 4 && (masterNorm.includes(sheetNorm) || sheetNorm.includes(masterNorm.slice(0, 8)));
+}
+
+/** Date range for roster map: full PJP month when loaded, else next N days from selected date. */
+function getRosterVisitDateRange() {
+  if (STATE.pjpMinDate && STATE.pjpMaxDate) {
+    return { startKey: dateKey(STATE.pjpMinDate), endKey: dateKey(STATE.pjpMaxDate) };
+  }
+  if (!STATE.filteredDate) return null;
+  const start = new Date(STATE.filteredDate);
   const end = new Date(start);
-  end.setDate(end.getDate() + days);
-  const endKey = dateKey(end);
-  const todayKey = STATE.filteredDate ? dateKey(new Date(STATE.filteredDate)) : startKey;
+  end.setDate(end.getDate() + UPCOMING_PJP_DAYS);
+  return { startKey: dateKey(start), endKey: dateKey(end) };
+}
+
+function resolvePlanEmpCode(plan) {
+  const ec = normalizeEmpCode(plan.empCode);
+  if (ec) return ec;
+  const m = plan.empName ? findAuditor(plan.empName, null) : null;
+  if (m) return normalizeEmpCode(m.empCode);
+  if (plan.sheet) {
+    const m2 = findAuditor(plan.sheet, null);
+    if (m2) return normalizeEmpCode(m2.empCode);
+  }
+  return '';
+}
+
+/** Market Visit markers for roster map (Col H = toTown). Uses full PJP month by default. */
+function buildRosterMarketVisitMarkers(empCodeFilter = null) {
+  if (!STATE.planRows.length) return [];
+  const range = getRosterVisitDateRange();
+  if (!range) return [];
+  const { startKey, endKey } = range;
+  const todayKey = STATE.filteredDate ? dateKey(new Date(STATE.filteredDate)) : null;
   const visitIdxByAuditor = {};
   const out = [];
   for (const plan of STATE.planRows) {
     if (!isMarketVisitWorkType(plan.workType) || !plan.dateKey || !plan.toTown) continue;
     if (plan.dateKey < startKey || plan.dateKey > endKey) continue;
-    const ec = normalizeEmpCode(plan.empCode);
-    if (empCodeFilter && normalizeEmpCode(empCodeFilter) !== ec) continue;
+    if (!planMatchesFocusAuditor(plan, empCodeFilter)) continue;
+    const ec = resolvePlanEmpCode(plan);
+    if (!ec) continue;
     const geo = resolveMarketVisitToTownCoords(plan);
     if (!geo) continue;
     const idx = visitIdxByAuditor[ec] || 0;
@@ -3290,10 +3345,22 @@ function buildUpcomingMarketVisitMarkers(fromDate, days = UPCOMING_PJP_DAYS, emp
       auditorName: master?.name || plan.empName || ec,
       dateKey: plan.dateKey,
       dateLabel: d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
-      isToday: plan.dateKey === todayKey,
+      isToday: todayKey != null && plan.dateKey === todayKey,
     });
   }
   return out.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+}
+
+/** Forward-looking window from a date (used for subtitles). */
+function buildUpcomingMarketVisitMarkers(fromDate, days = UPCOMING_PJP_DAYS, empCodeFilter = null) {
+  if (!STATE.planRows.length || !fromDate) return [];
+  const startKey = dateKey(fromDate instanceof Date ? fromDate : new Date(fromDate));
+  const end = new Date(fromDate instanceof Date ? fromDate : new Date(fromDate));
+  end.setDate(end.getDate() + days);
+  const endKey = dateKey(end);
+  return buildRosterMarketVisitMarkers(empCodeFilter).filter(
+    (v) => v.dateKey >= startKey && v.dateKey <= endKey
+  );
 }
 
 function buildMapAuditorEntries() {
@@ -3422,11 +3489,11 @@ function populateMapPjpAuditorSelect() {
     auditors
       .map(
         (a) =>
-          `<option value="${escapeHtml(a.empCode)}">${escapeHtml(a.name)} · ${escapeHtml(a.cluster || a.empCode)}</option>`
+          `<option value="${escapeHtml(normalizeEmpCode(a.empCode))}">${escapeHtml(a.name)} · ${escapeHtml(a.cluster || a.empCode)}</option>`
       )
       .join('');
   if (prev && (prev === '' || auditors.some((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(prev)))) {
-    select.value = prev;
+    select.value = normalizeEmpCode(prev) || prev;
   }
   STATE.mapPjpSelectedAuditor = select.value;
 }
@@ -3607,8 +3674,13 @@ function setMapSection(section) {
   $('pjp-roster-table-wrap')?.classList.toggle('hidden', !isRoster);
   if ($('pjp-roster-table-wrap')) $('pjp-roster-table-wrap').style.display = isRoster ? 'block' : 'none';
   updateMapSubtitle();
-  renderMap();
-  if (isRoster) renderPjpRosterTable();
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      if (STATE.map) STATE.map.invalidateSize();
+      renderMap();
+      if (isRoster) renderPjpRosterTable();
+    }, 80);
+  });
 }
 
 function updateMapSubtitle() {
@@ -3621,11 +3693,7 @@ function updateMapSubtitle() {
     : '—';
   if (STATE.mapSection === 'roster') {
     const focus = $('map-pjp-auditor')?.value || '';
-    const fromDate = STATE.filteredDate ? new Date(STATE.filteredDate) : null;
-    const visits =
-      fromDate && STATE.planRows.length
-        ? buildUpcomingMarketVisitMarkers(fromDate, UPCOMING_PJP_DAYS, focus || null).length
-        : 0;
+    const visits = STATE.planRows.length ? buildRosterMarketVisitMarkers(focus || null).length : 0;
     const tableN = buildPjpRosterTableRows().length;
     let sub = `30-day PJP roster · ${dateStr} · ${visits} Market Visit points on map`;
     if (tableN) sub += ` · ${tableN} roster rows`;
@@ -3763,14 +3831,32 @@ function renderMapCurrentSection() {
 function renderMapRosterSection() {
   const allPoints = [];
   const focusCode = $('map-pjp-auditor')?.value || '';
-  const fromDate = STATE.filteredDate ? new Date(STATE.filteredDate) : null;
   const gpsByCode = {};
   buildMapAuditorEntries().forEach((e) => {
     if (e.location) gpsByCode[e.code] = e;
   });
 
-  if (fromDate && STATE.planRows.length) {
-    const upcoming = buildUpcomingMarketVisitMarkers(fromDate, UPCOMING_PJP_DAYS, focusCode || null);
+  const focusMaster = focusCode
+    ? AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focusCode))
+    : null;
+  if (focusMaster?.lat != null && focusMaster.lng != null) {
+    const baseMarker = L.circleMarker([focusMaster.lat, focusMaster.lng], {
+      radius: 7,
+      fillColor: 'transparent',
+      color: '#fbbf24',
+      weight: 2.5,
+      opacity: 1,
+      fillOpacity: 0,
+    }).addTo(STATE.map);
+    baseMarker.bindPopup(
+      `<div style="font-family:Inter,sans-serif"><strong>🏠 ${escapeHtml(focusMaster.name)}</strong><br>Base: ${escapeHtml(focusMaster.hometown || '')}</div>`
+    );
+    STATE.markers.push(baseMarker);
+    allPoints.push([focusMaster.lat, focusMaster.lng]);
+  }
+
+  if (STATE.planRows.length) {
+    const upcoming = buildRosterMarketVisitMarkers(focusCode || null);
     upcoming.forEach((v) => {
       const m = L.circleMarker([v.coords.lat, v.coords.lng], {
         radius: v.isToday ? 7 : 5,
@@ -3846,6 +3932,8 @@ function renderMapRosterSection() {
 
   if (allPoints.length) {
     STATE.map.fitBounds(L.latLngBounds(allPoints), { padding: [48, 48], maxZoom: focusCode ? 9 : 6 });
+  } else if (focusMaster?.lat != null) {
+    STATE.map.setView([focusMaster.lat, focusMaster.lng], 8);
   }
 }
 
