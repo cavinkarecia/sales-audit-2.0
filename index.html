@@ -999,27 +999,6 @@ html, body {
                 <div class="legend-item"><span class="legend-line" style="border-color:#38bdf8"></span> GPS → audit site (km)</div>
               </div>
             </div>
-            <div id="pjp-roster-table-wrap" class="pjp-roster-table-wrap hidden" style="display:none">
-              <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:10px;align-items:center">
-                <div class="panel-title" style="font-size:14px;margin:0">PJP roster — plan vs actual</div>
-                <input type="text" class="search-input" id="pjp-roster-search" placeholder="Search auditor, cluster, location…" style="max-width:280px;margin-left:auto" />
-              </div>
-              <table class="table" id="pjp-roster-table">
-                <thead>
-                  <tr>
-                    <th>Date</th>
-                    <th>Sales auditor</th>
-                    <th>Cluster</th>
-                    <th>Base location</th>
-                    <th>Followed PJP?</th>
-                    <th>Next location</th>
-                    <th>Distance (km)</th>
-                    <th>Travel days (month)</th>
-                  </tr>
-                </thead>
-                <tbody id="pjp-roster-tbody"></tbody>
-              </table>
-            </div>
           </div>
         </div>
 
@@ -1035,16 +1014,16 @@ html, body {
           <div class="panel-body" id="unmatched-body" style="padding:14px 20px"></div>
         </div>
 
-        <!-- FIELD FORCE TABLE -->
+        <!-- UNIFIED AUDITOR TABLE — plan vs actual + live GPS -->
         <div class="panel">
           <div class="panel-head">
             <div>
-              <div class="panel-title">Field Force Live Status</div>
-              <div class="panel-sub" id="ff-sub">Auditor positions, proximity to base, and ASM mapping</div>
+              <div class="panel-title">Sales auditors — plan vs actual</div>
+              <div class="panel-sub" id="ff-sub">All auditors for selected date · PJP planned site vs attendance GPS</div>
             </div>
           </div>
           <div class="filter-bar">
-            <input type="text" class="search-input" id="ff-search" placeholder="Search auditor, location, ASM, cluster…" />
+            <input type="text" class="search-input" id="ff-search" placeholder="Search auditor, location, ASM, cluster, PJP town…" />
             <select class="select" id="ff-cluster-filter">
               <option value="all">All clusters</option>
               <option value="TN">TN</option>
@@ -1071,14 +1050,20 @@ html, body {
             <table class="table" id="ff-table">
               <thead>
                 <tr>
-                  <th>Auditor</th>
+                  <th>Date</th>
+                  <th>Sales auditor</th>
                   <th>Cluster</th>
-                  <th>Base Location</th>
-                  <th>Current Location</th>
-                  <th>Distance (km)</th>
+                  <th>Base location</th>
+                  <th>Current location</th>
+                  <th>Dist base (km)</th>
                   <th>Status</th>
+                  <th>PJP planned (Col H)</th>
+                  <th>Followed PJP?</th>
+                  <th>Dist PJP (km)</th>
+                  <th>Next location</th>
+                  <th>Travel days</th>
                   <th>ASM</th>
-                  <th style="text-align:right">Total Shops</th>
+                  <th style="text-align:right">Shops</th>
                 </tr>
               </thead>
               <tbody id="ff-tbody"></tbody>
@@ -1633,7 +1618,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.21';
+const SENTINEL_BUILD = '2026.06.22';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -2933,7 +2918,6 @@ function refreshDashboard() {
   renderFieldForceTable();
   renderMap();
   renderMapPjpPanel();
-  if (STATE.mapSection === 'roster') renderPjpRosterTable();
   renderUnmatchedPanel();
   requestAnimationFrame(() => {
     setTimeout(() => {
@@ -3096,51 +3080,131 @@ function computeKPIs() {
 }
 
 // =================================================================
-// FIELD FORCE TABLE
+// UNIFIED AUDITOR TABLE — live GPS + PJP plan vs actual (selected date)
 // =================================================================
-function buildFieldForceRows() {
-  // For each auditor reporting on this date, look up their HOME TOWN from the master list.
-  // Base location: their declared hometown (curated lat/lng).
-  // Current location: the lat/lng they reported today.
-  return STATE.dateFiltered.map(r => {
-    const master = findAuditor(r.auditor, r.auditorId);
-    const baseName = master ? master.hometown : 'Unknown';
-    const baseCoords = (master && master.lat != null) ? { lat: master.lat, lng: master.lng } : null;
-    const currentName = r.location ? (nearestCityName(r.location.lat, r.location.lng) || 'Unknown') : 'Unknown';
+function getPlanForAuditorOnDate(empCode, master, dKey) {
+  if (!dKey) return null;
+  const ec = normalizeEmpCode(empCode);
+  return (
+    STATE.planByEmpDate[`${ec}|${dKey}`] ||
+    (master && STATE.planByNameDate[`${normalizeName(master.name)}|${dKey}`]) ||
+    null
+  );
+}
+
+/** One row per sales auditor in PJP universe (or submissions) for the selected date. */
+function buildUnifiedAuditorTableRows() {
+  const dKey = STATE.filteredDate;
+  if (!dKey) return [];
+  const dateLabel = new Date(`${dKey}T12:00:00`).toLocaleDateString('en-IN', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+
+  let auditors;
+  if (STATE.pjpEmpCodes.size > 0) {
+    auditors = getAuditorsUniverse();
+  } else {
+    auditors = (STATE.dateFiltered || [])
+      .map((r) => findAuditor(r.auditor, r.auditorId))
+      .filter(Boolean);
+  }
+
+  return auditors.map((master) => {
+    const code = normalizeEmpCode(master.empCode);
+    const attRaw = getAttendanceForAuditorOnDate(code, dKey);
+    const att = attRaw ? hydrateAttendanceRow(attRaw) : null;
+    const plan = getPlanForAuditorOnDate(code, master, dKey);
+    const baseName = master.hometown || '—';
+    const currentName = att?.location
+      ? nearestCityName(att.location.lat, att.location.lng) ||
+        `${att.location.lat.toFixed(2)}, ${att.location.lng.toFixed(2)}`
+      : att
+        ? '—'
+        : 'No submission';
+
     let proximity = null;
-    if (baseCoords && r.location) {
-      proximity = haversineKm(baseCoords.lat, baseCoords.lng, r.location.lat, r.location.lng);
+    if (master.lat != null && master.lng != null && att?.location) {
+      proximity = haversineKm(master.lat, master.lng, att.location.lat, att.location.lng);
     }
+
+    const plannedTown = plan?.toTown || '—';
+    const workType = plan?.workType || '—';
+    const plannedCoords = plan?.toTown ? resolveCityCoords(plan.toTown) : null;
+    const actualCoords = att?.location || null;
+    let distToPlan = null;
+    let followed = '—';
+    if (!STATE.planRows.length) {
+      followed = '—';
+    } else if (!plan || !plan.workType) {
+      followed = 'No plan';
+    } else if (!att) {
+      followed = 'No submission';
+    } else if (actualCoords && plannedCoords) {
+      distToPlan = haversineKm(plannedCoords.lat, plannedCoords.lng, actualCoords.lat, actualCoords.lng);
+      followed = distToPlan <= PLANNED_SITE_MATCH_KM ? 'Yes' : 'No';
+    } else if (att && !actualCoords) {
+      followed = att.onField ? 'On field (no GPS)' : 'Absent (no GPS)';
+    } else if (plan.toTown && !plannedCoords) {
+      followed = 'Unknown town';
+    } else if (!isMarketVisitWorkType(plan.workType) && !/travel\s*day/i.test(plan.workType || '')) {
+      followed = 'Off-day / leave';
+    }
+
+    let status = 'No submission';
+    if (att) status = att.onField ? 'On Field' : 'Absent';
+
     return {
-      ...r,
-      master,
+      dateLabel,
+      auditorName: master.name || att?.auditor || code,
+      empCode: code,
+      cluster: master.cluster || '—',
       baseName,
-      baseCoords,
       currentName,
       proximity,
-      cluster: master ? master.cluster : '—',
-      empCode: master ? master.empCode : (r.auditorId ? String(r.auditorId).split('(')[0].trim() : 'N/A'),
-      status: r.onField ? 'On Field' : 'Offline',
+      status,
+      absentReason: att?.absentReason,
+      asm: att?.asm || plan?.asm || '—',
+      totalShops: att?.totalShops || 0,
+      plannedTown,
+      workType,
+      followed,
+      distToPlan,
+      nextLocation: STATE.planRows.length ? getNextMarketVisitTown(code, dKey) : '—',
+      travelDaysMonth: STATE.planRows.length ? countTravelDaysInMonth(code) : '—',
+      noSubmission: !att,
     };
   });
 }
 
 function renderFieldForceTable() {
-  const rows = buildFieldForceRows();
-  const search = $('ff-search').value.toLowerCase();
-  const statusFilter = $('ff-status-filter').value;
-  const proxFilter = $('ff-prox-filter').value;
-  const clusterFilter = $('ff-cluster-filter').value;
+  const rows = buildUnifiedAuditorTableRows();
+  const search = ($('ff-search')?.value || '').toLowerCase();
+  const statusFilter = $('ff-status-filter')?.value || 'all';
+  const proxFilter = $('ff-prox-filter')?.value || 'all';
+  const clusterFilter = $('ff-cluster-filter')?.value || 'all';
 
-  const filtered = rows.filter(r => {
-    if (search && !(
-      (r.auditor || '').toLowerCase().includes(search) ||
-      (r.baseName || '').toLowerCase().includes(search) ||
-      (r.currentName || '').toLowerCase().includes(search) ||
-      (r.asm || '').toLowerCase().includes(search) ||
-      (r.cluster || '').toLowerCase().includes(search)
-    )) return false;
-    if (statusFilter !== 'all' && r.status !== statusFilter) return false;
+  const filtered = rows.filter((r) => {
+    if (
+      search &&
+      !(
+        (r.auditorName || '').toLowerCase().includes(search) ||
+        (r.empCode || '').toLowerCase().includes(search) ||
+        (r.baseName || '').toLowerCase().includes(search) ||
+        (r.currentName || '').toLowerCase().includes(search) ||
+        (r.plannedTown || '').toLowerCase().includes(search) ||
+        (r.followed || '').toLowerCase().includes(search) ||
+        (r.nextLocation || '').toLowerCase().includes(search) ||
+        (r.asm || '').toLowerCase().includes(search) ||
+        (r.cluster || '').toLowerCase().includes(search) ||
+        (r.workType || '').toLowerCase().includes(search)
+      )
+    ) {
+      return false;
+    }
+    if (statusFilter === 'On Field' && r.status !== 'On Field') return false;
+    if (statusFilter === 'Offline' && r.status !== 'Absent' && r.status !== 'No submission') return false;
     if (clusterFilter !== 'all' && r.cluster !== clusterFilter) return false;
     if (proxFilter === 'near' && (r.proximity == null || r.proximity > 25)) return false;
     if (proxFilter === 'medium' && (r.proximity == null || r.proximity <= 25 || r.proximity > 100)) return false;
@@ -3148,56 +3212,79 @@ function renderFieldForceTable() {
     return true;
   });
 
-  $('ff-count').textContent = `${filtered.length} of ${rows.length} records`;
+  const submitted = rows.filter((r) => !r.noSubmission).length;
+  if ($('ff-count')) {
+    $('ff-count').textContent = `${filtered.length} of ${rows.length} auditors · ${submitted} submitted`;
+  }
 
   const tbody = $('ff-tbody');
+  if (!tbody) return;
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="table-empty">No records match the current filters.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="14" class="table-empty">No auditors match filters. Upload PJP + attendance and pick a date.</td></tr>`;
     return;
   }
 
-  // Sort by status (On Field first), then by name
   filtered.sort((a, b) => {
-    if (a.status !== b.status) return a.status === 'On Field' ? -1 : 1;
-    return (a.auditor || '').localeCompare(b.auditor || '');
+    const order = { 'On Field': 0, Absent: 1, 'No submission': 2 };
+    const sa = order[a.status] ?? 3;
+    const sb = order[b.status] ?? 3;
+    if (sa !== sb) return sa - sb;
+    return String(a.auditorName).localeCompare(String(b.auditorName));
   });
 
-  tbody.innerHTML = filtered.map(r => {
-    let proxClass = 'unknown';
-    let proxText = 'N/A';
-    if (r.proximity != null) {
-      proxText = r.proximity.toFixed(1);
-      if (r.proximity <= 25) proxClass = 'near';
-      else if (r.proximity <= 100) proxClass = 'medium';
-      else proxClass = 'far';
-    }
-    const statusPill = r.status === 'On Field'
-      ? `<span class="pill pill-on">On Field</span>`
-      : `<span class="pill pill-off">Offline</span>`;
-    const clusterPill = r.cluster && r.cluster !== '—'
-      ? `<span class="cluster-pill cluster-${r.cluster.toLowerCase()}">${escapeHtml(r.cluster)}</span>`
-      : `<span class="text-faint">—</span>`;
-    return `
+  tbody.innerHTML = filtered
+    .map((r) => {
+      let proxClass = 'unknown';
+      let proxText = '—';
+      if (r.proximity != null) {
+        proxText = r.proximity.toFixed(1);
+        if (r.proximity <= 25) proxClass = 'near';
+        else if (r.proximity <= 100) proxClass = 'medium';
+        else proxClass = 'far';
+      }
+      const distPlan =
+        r.distToPlan != null
+          ? `<span class="proximity ${r.distToPlan > 100 ? 'far' : r.distToPlan > 35 ? 'medium' : 'near'}">${r.distToPlan.toFixed(1)}</span>`
+          : '—';
+      const followCls =
+        r.followed === 'Yes' ? 'pill-on' : String(r.followed).startsWith('No') ? 'pill-absent' : 'pill-off';
+      const statusPill =
+        r.status === 'On Field'
+          ? '<span class="pill pill-on">On Field</span>'
+          : r.status === 'Absent'
+            ? `<span class="pill pill-absent">${escapeHtml(r.absentReason || 'Absent')}</span>`
+            : '<span class="pill pill-off">No submission</span>';
+      const clusterPill =
+        r.cluster && r.cluster !== '—'
+          ? `<span class="cluster-pill cluster-${String(r.cluster).toLowerCase()}">${escapeHtml(r.cluster)}</span>`
+          : '<span class="text-faint">—</span>';
+      return `
       <tr>
-        <td>
-          <div class="table-name">${escapeHtml(r.auditor || 'Unknown')}</div>
-          <div class="table-sub mono">${escapeHtml(r.empCode || 'N/A')}</div>
-        </td>
+        <td>${escapeHtml(r.dateLabel)}</td>
+        <td><div class="table-name">${escapeHtml(r.auditorName)}</div><div class="table-sub mono">${escapeHtml(r.empCode)}</div></td>
         <td>${clusterPill}</td>
         <td>${escapeHtml(r.baseName)}</td>
         <td>${escapeHtml(r.currentName)}</td>
-        <td><span class="proximity ${proxClass}">${proxText}</span></td>
+        <td style="text-align:right"><span class="proximity ${proxClass}">${proxText}</span></td>
         <td>${statusPill}</td>
-        <td>${escapeHtml(r.asm || 'N/A')}</td>
+        <td><div>${escapeHtml(r.plannedTown)}</div><div class="table-sub">${escapeHtml(r.workType)}</div></td>
+        <td><span class="pill ${followCls}">${escapeHtml(r.followed)}</span></td>
+        <td style="text-align:right">${distPlan}</td>
+        <td>${escapeHtml(r.nextLocation)}</td>
+        <td style="text-align:center">${r.travelDaysMonth}</td>
+        <td>${escapeHtml(r.asm)}</td>
         <td style="text-align:right">${fmt(Number(r.totalShops) || 0)}</td>
-      </tr>
-    `;
-  }).join('');
+      </tr>`;
+    })
+    .join('');
 }
 
-['ff-search', 'ff-status-filter', 'ff-prox-filter', 'ff-cluster-filter'].forEach(id => {
-  $(id).addEventListener('input', renderFieldForceTable);
-  $(id).addEventListener('change', renderFieldForceTable);
+['ff-search', 'ff-status-filter', 'ff-prox-filter', 'ff-cluster-filter'].forEach((id) => {
+  const el = $(id);
+  if (el) {
+    el.addEventListener('input', renderFieldForceTable);
+    el.addEventListener('change', renderFieldForceTable);
+  }
 });
 
 // =================================================================
@@ -3623,105 +3710,6 @@ function getAttendanceForAuditorOnDate(empCode, dKey) {
   );
 }
 
-function buildPjpRosterTableRows() {
-  if (!STATE.pjpMinDate || !STATE.pjpMaxDate || !STATE.planRows.length) return [];
-  const rows = [];
-  const travelCache = {};
-  for (const master of getAuditorsUniverse()) {
-    const code = normalizeEmpCode(master.empCode);
-    travelCache[code] = countTravelDaysInMonth(code);
-    const cursor = new Date(STATE.pjpMinDate);
-    const end = new Date(STATE.pjpMaxDate);
-    while (cursor <= end) {
-      const dKey = dateKey(cursor);
-      const plan = STATE.planByEmpDate[`${code}|${dKey}`];
-      if (!plan || !isMarketVisitWorkType(plan.workType)) {
-        cursor.setDate(cursor.getDate() + 1);
-        continue;
-      }
-      const actual = getAttendanceForAuditorOnDate(code, dKey);
-      const plannedCoords = plan.toTown ? resolveCityCoords(plan.toTown) : null;
-      const actualCoords = actual?.location || null;
-      let distanceKm = null;
-      let followed = 'No submission';
-      if (actualCoords && plannedCoords) {
-        distanceKm = haversineKm(plannedCoords.lat, plannedCoords.lng, actualCoords.lat, actualCoords.lng);
-        followed = distanceKm <= PLANNED_SITE_MATCH_KM ? 'Yes' : 'No';
-      } else if (actual && !actualCoords) {
-        followed = actual.onField ? 'Yes (no GPS)' : 'No (no GPS)';
-      } else if (!actual) {
-        followed = 'No submission';
-      } else if (!plannedCoords) {
-        followed = 'Unknown town';
-      }
-      rows.push({
-        dateKey: dKey,
-        dateLabel: cursor.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
-        auditorName: master.name,
-        cluster: master.cluster || '—',
-        baseLocation: master.hometown || '—',
-        plannedTown: plan.toTown || '—',
-        followed,
-        nextLocation: getNextMarketVisitTown(code, dKey),
-        distanceKm,
-        travelDaysMonth: travelCache[code],
-        empCode: code,
-      });
-      cursor.setDate(cursor.getDate() + 1);
-    }
-  }
-  return rows.sort(
-    (a, b) => a.dateKey.localeCompare(b.dateKey) || String(a.auditorName).localeCompare(String(b.auditorName))
-  );
-}
-
-function renderPjpRosterTable() {
-  const tbody = $('pjp-roster-tbody');
-  if (!tbody) return;
-  const q = ($('pjp-roster-search')?.value || '').toLowerCase();
-  let rows = buildPjpRosterTableRows();
-  if (q) {
-    rows = rows.filter(
-      (r) =>
-        r.auditorName.toLowerCase().includes(q) ||
-        r.cluster.toLowerCase().includes(q) ||
-        r.baseLocation.toLowerCase().includes(q) ||
-        r.plannedTown.toLowerCase().includes(q) ||
-        r.nextLocation.toLowerCase().includes(q) ||
-        r.followed.toLowerCase().includes(q)
-    );
-  }
-  if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="8" class="table-empty">Upload PJP + attendance to see roster rows (Market Visit days).</td></tr>`;
-    return;
-  }
-  tbody.innerHTML = rows
-    .map((r) => {
-      const dist =
-        r.distanceKm != null
-          ? `<span class="proximity ${r.distanceKm > 100 ? 'far' : r.distanceKm > 35 ? 'medium' : 'near'}">${r.distanceKm.toFixed(1)}</span>`
-          : '—';
-      const followCls =
-        r.followed === 'Yes' ? 'pill-on' : r.followed.startsWith('No') ? 'pill-absent' : 'pill-off';
-      return `
-      <tr>
-        <td>${escapeHtml(r.dateLabel)}</td>
-        <td><div class="table-name">${escapeHtml(r.auditorName)}</div><div class="table-sub mono">${escapeHtml(r.empCode)}</div></td>
-        <td>${
-          r.cluster && r.cluster !== '—'
-            ? `<span class="cluster-pill cluster-${String(r.cluster).toLowerCase()}">${escapeHtml(r.cluster)}</span>`
-            : '<span class="text-faint">—</span>'
-        }</td>
-        <td>${escapeHtml(r.baseLocation)}</td>
-        <td><span class="pill ${followCls}">${escapeHtml(r.followed)}</span><div class="table-sub">Planned: ${escapeHtml(r.plannedTown)}</div></td>
-        <td>${escapeHtml(r.nextLocation)}</td>
-        <td style="text-align:right">${dist}</td>
-        <td style="text-align:center">${r.travelDaysMonth}</td>
-      </tr>`;
-    })
-    .join('');
-}
-
 function setMapSection(section) {
   STATE.mapSection = section === 'roster' ? 'roster' : 'current';
   if (STATE.mapSection === 'current' && $('map-pjp-auditor')) {
@@ -3740,14 +3728,11 @@ function setMapSection(section) {
   if ($('map-legend-current')) $('map-legend-current').style.display = isRoster ? 'none' : 'block';
   $('map-legend-roster')?.classList.toggle('hidden', !isRoster);
   if ($('map-legend-roster')) $('map-legend-roster').style.display = isRoster ? 'block' : 'none';
-  $('pjp-roster-table-wrap')?.classList.toggle('hidden', !isRoster);
-  if ($('pjp-roster-table-wrap')) $('pjp-roster-table-wrap').style.display = isRoster ? 'block' : 'none';
   updateMapSubtitle();
   requestAnimationFrame(() => {
     setTimeout(() => {
       if (STATE.map) STATE.map.invalidateSize();
       renderMap();
-      if (isRoster) renderPjpRosterTable();
     }, 80);
   });
 }
@@ -3763,9 +3748,9 @@ function updateMapSubtitle() {
   if (STATE.mapSection === 'roster') {
     const focus = $('map-pjp-auditor')?.value || '';
     const visits = STATE.planRows.length ? buildRosterMarketVisitMarkers(focus || null).length : 0;
-    const tableN = buildPjpRosterTableRows().length;
+    const tableN = buildUnifiedAuditorTableRows().length;
     let sub = `30-day PJP roster · ${dateStr} · ${visits} Market Visit points on map`;
-    if (tableN) sub += ` · ${tableN} roster rows`;
+    if (tableN) sub += ` · ${tableN} auditors in table`;
     if (focus) {
       const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focus));
       sub = `${m?.name || focus} · ${sub}`;
@@ -3780,7 +3765,6 @@ function updateMapSubtitle() {
 
 function renderMapPjpPanel() {
   updateMapSubtitle();
-  if (STATE.mapSection === 'roster') renderPjpRosterTable();
 }
 
 document.querySelectorAll('.map-tab').forEach((btn) => {
@@ -3790,10 +3774,7 @@ document.querySelectorAll('.map-tab').forEach((btn) => {
 $('map-pjp-auditor')?.addEventListener('change', () => {
   STATE.mapPjpSelectedAuditor = $('map-pjp-auditor').value;
   renderMap();
-  renderPjpRosterTable();
 });
-
-$('pjp-roster-search')?.addEventListener('input', renderPjpRosterTable);
 
 // =================================================================
 // MAP
