@@ -4,7 +4,7 @@
   "description": "Backend for Sentinel Sales Audit Intelligence (Render)",
   "main": "server.js",
   "scripts": {
-    "start": "node --max-old-space-size=384 server.js",
+    "start": "node --max-old-space-size=460 server.js",
     "dev": "node server.js"
   },
   "engines": {

@@ -267,7 +267,7 @@ async function loadStateSummary(sessionId) {
   await ensureSession(sessionId);
   const pool = getPool();
 
-  const [att, pjp, claimsRes] = await Promise.all([
+  const [att, pjp, claimCountRes] = await Promise.all([
     pool.query(
       `SELECT filename,
         CASE WHEN rows IS NULL THEN 0 ELSE jsonb_array_length(rows) END AS row_count
@@ -280,10 +280,7 @@ async function loadStateSummary(sessionId) {
        FROM pjp_snapshots WHERE session_id = $1`,
       [sessionId]
     ),
-    pool.query(
-      'SELECT payload FROM claims WHERE session_id = $1 ORDER BY created_at DESC',
-      [sessionId]
-    ),
+    pool.query('SELECT COUNT(*)::int AS n FROM claims WHERE session_id = $1', [sessionId]),
   ]);
 
   const meta = pjp.rows[0]?.meta || {};
@@ -299,7 +296,7 @@ async function loadStateSummary(sessionId) {
     pjpMinDate: meta.pjpMinDate || null,
     pjpMaxDate: meta.pjpMaxDate || null,
     pjpEmpCodes: meta.pjpEmpCodes || [],
-    claims: claimsRes.rows.map((r) => slimClaimForClient(r.payload)),
+    claimCount: claimCountRes.rows[0]?.n || 0,
     _hasAttendance: rawRowCount > 0,
     _hasPjp: planRowCount > 0,
   };
@@ -321,7 +318,7 @@ function buildStateSummaryPayload(summary, filteredDate) {
     pjpMaxDate: summary.pjpMaxDate,
     pjpEmpCodes: summary.pjpEmpCodes,
     filteredDate: defaultDate,
-    claims: summary.claims,
+    claimCount: summary.claimCount || 0,
     hasAttendance: summary._hasAttendance,
     hasPjp: summary._hasPjp,
     aiKeySource: process.env.ANTHROPIC_API_KEY ? 'server' : 'browser',
@@ -333,7 +330,7 @@ function buildStateSummaryPayload(summary, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.10-main2' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.11-main2' });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -397,7 +394,7 @@ app.get('/api/state', authRequired, async (req, res) => {
             pjpMinDate: null,
             pjpMaxDate: null,
             pjpEmpCodes: [],
-            claims: [],
+            claimCount: 0,
             _hasAttendance: false,
             _hasPjp: false,
           },
@@ -582,7 +579,7 @@ app.get('/api/claims', authRequired, async (req, res) => {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
     const workspace = await loadWorkspace(sessionId);
-    res.json({ claims: workspace.claims });
+    res.json({ claims: workspace.claims.map(slimClaimForClient) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });

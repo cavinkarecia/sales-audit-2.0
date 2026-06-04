@@ -18,7 +18,7 @@ services:
     healthCheckPath: /health
     envVars:
       - key: NODE_OPTIONS
-        value: --max-old-space-size=384
+        value: --max-old-space-size=460
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL

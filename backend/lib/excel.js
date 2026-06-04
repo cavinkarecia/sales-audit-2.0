@@ -59,11 +59,19 @@ function normalizePlanRow(r, sheetName) {
   };
 }
 
+const MAX_ATTENDANCE_ROWS = 20000;
+const MAX_PJP_ROWS = 35000;
+
 function parseAttendanceBuffer(buffer) {
   const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
   const sheetName = wb.SheetNames[0];
   const rows = XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { defval: null });
   if (!rows.length) throw new Error('The attendance file appears empty.');
+  if (rows.length > MAX_ATTENDANCE_ROWS) {
+    throw new Error(
+      `Attendance file has ${rows.length.toLocaleString()} rows (max ${MAX_ATTENDANCE_ROWS.toLocaleString()}). Split by month or remove extra rows.`
+    );
+  }
   return rows.map(normalizeRow);
 }
 
@@ -83,6 +91,11 @@ function parsePjpBuffer(buffer) {
   }
 
   if (!planRows.length) throw new Error('The PJP file appears empty.');
+  if (planRows.length > MAX_PJP_ROWS) {
+    throw new Error(
+      `PJP file has ${planRows.length.toLocaleString()} plan rows (max ${MAX_PJP_ROWS.toLocaleString()}). Split the workbook or remove extra rows.`
+    );
+  }
 
   const dates = planRows.map((p) => p.date).filter(Boolean).map((d) => new Date(d));
   let pjpMonth = null;
@@ -141,6 +154,8 @@ function pickDefaultDate(rawRows, pjpMinDate, pjpMaxDate) {
 }
 
 module.exports = {
+  MAX_ATTENDANCE_ROWS,
+  MAX_PJP_ROWS,
   parseAttendanceBuffer,
   parsePjpBuffer,
   buildPlanIndexes,

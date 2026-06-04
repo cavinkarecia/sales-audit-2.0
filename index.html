@@ -1560,7 +1560,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.10';
+const SENTINEL_BUILD = '2026.06.11';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1680,10 +1680,15 @@ function applyStateFromServer(data) {
     STATE.planByNameDate = planIdx.planByNameDate;
   }
   STATE.filteredDate = data.filteredDate || null;
-  STATE.claims = (data.claims || []).map(c => ({
-    ...c,
-    submittedAt: c.submittedAt ? new Date(c.submittedAt) : new Date(),
-  }));
+  if (data.claims) {
+    STATE.claims = (data.claims || []).map(c => ({
+      ...c,
+      submittedAt: c.submittedAt ? new Date(c.submittedAt) : new Date(),
+    }));
+    STATE._claimsLoaded = true;
+  } else {
+    STATE.claimCount = data.claimCount || 0;
+  }
   if (STATE.filteredDate) $('date-filter').value = STATE.filteredDate;
   if (STATE.pjpMinDate) $('date-filter').min = dateKey(STATE.pjpMinDate);
   if (STATE.pjpMaxDate) $('date-filter').max = dateKey(STATE.pjpMaxDate);
@@ -1722,26 +1727,7 @@ async function backendLogin(password) {
   return true;
 }
 
-async function loadStateFromBackend() {
-  await ensureBackendSession();
-  const resp = await apiFetch('/api/state');
-  if (!resp.ok) throw new Error('Failed to load saved data');
-  const data = await resp.json();
-  applyStateFromServer(data);
-  if (data.hasAttendance && !(data.rawRows?.length)) {
-    try {
-      await loadAttendanceFromBackend();
-    } catch (err) {
-      console.warn('Attendance load:', err);
-    }
-  }
-  if (data.hasPjp && !(data.planRows?.length)) {
-    try {
-      await loadPjpFromBackend();
-    } catch (err) {
-      console.warn('PJP load:', err);
-    }
-  }
+function finishWorkspaceUiAfterLoad() {
   updateFileChips();
   updateDualSummary();
   if (STATE.attendanceFileName) $('upload-zone-attendance')?.classList.add('loaded');
@@ -1749,10 +1735,60 @@ async function loadStateFromBackend() {
   if (STATE.rawRows.length) {
     showLoadedState();
     refreshDashboard();
-  } else if (STATE.pjpFileName && STATE.planRows.length) {
+  } else if (STATE.pjpFileName && (STATE.planRows.length || STATE.planRowCount)) {
     showLoadedState();
   }
   if (STATE.currentView === 'expense') renderExpenseView();
+}
+
+async function loadStateFromBackend(options = {}) {
+  const { attendance = true, pjp = true } = options;
+  await ensureBackendSession();
+  const resp = await apiFetch('/api/state');
+  if (!resp.ok) {
+    const errBody = await resp.text().catch(() => '');
+    throw new Error(errBody.slice(0, 200) || `Failed to load saved data (HTTP ${resp.status})`);
+  }
+  const data = await resp.json();
+  applyStateFromServer(data);
+  if (attendance && data.hasAttendance && !(data.rawRows?.length)) {
+    try {
+      await loadAttendanceFromBackend();
+    } catch (err) {
+      console.warn('Attendance load:', err);
+      throw new Error(`Attendance saved on server but could not download rows: ${err.message}`);
+    }
+  }
+  if (pjp && data.hasPjp && !(data.planRows?.length)) {
+    try {
+      await loadPjpFromBackend();
+    } catch (err) {
+      console.warn('PJP load:', err);
+      throw new Error(`PJP saved on server but could not download plan rows: ${err.message}`);
+    }
+  }
+  finishWorkspaceUiAfterLoad();
+}
+
+async function reloadWorkspaceAfterUpload(kind, data) {
+  if (kind === 'attendance') {
+    await loadAttendanceFromBackend();
+    STATE.attendanceFileName = data.attendanceFileName || STATE.attendanceFileName;
+    STATE.attendanceRowCount = data.rowCount || STATE.rawRows.length;
+  } else {
+    await loadPjpFromBackend();
+    STATE.pjpFileName = data.pjpFileName || STATE.pjpFileName;
+    STATE.pjpMonth = data.pjpMonth || STATE.pjpMonth;
+    if (data.pjpMinDate) STATE.pjpMinDate = new Date(data.pjpMinDate);
+    if (data.pjpMaxDate) STATE.pjpMaxDate = new Date(data.pjpMaxDate);
+    if (data.pjpEmpCodes) STATE.pjpEmpCodes = new Set(data.pjpEmpCodes);
+    STATE.planRowCount = data.planRowCount || STATE.planRows.length;
+  }
+  if (data.filteredDate) {
+    STATE.filteredDate = data.filteredDate;
+    $('date-filter').value = data.filteredDate;
+  }
+  finishWorkspaceUiAfterLoad();
 }
 
 async function bootstrapBackend() {
@@ -1768,6 +1804,10 @@ async function bootstrapBackend() {
     await loadStateFromBackend();
   } catch (err) {
     console.warn('Backend bootstrap:', err);
+    alert(
+      'Could not load saved session from server. You can still upload files, or clear site data and refresh.\n\n' +
+        (err?.message || '')
+    );
   }
 }
 
@@ -2324,11 +2364,7 @@ async function handleFile(file, kind) {
         return;
       }
       if (data.reload) {
-        await loadStateFromBackend();
-        if (data.filteredDate) {
-          STATE.filteredDate = data.filteredDate;
-          $('date-filter').value = data.filteredDate;
-        }
+        await reloadWorkspaceAfterUpload(kind, data);
       } else {
         applyStateFromServer(data);
         updateFileChips();
@@ -2342,7 +2378,14 @@ async function handleFile(file, kind) {
       }
     } catch (err) {
       console.error(err);
-      alert('Could not upload file. Check your connection and try again.');
+      const msg = err?.message || '';
+      alert(
+        msg.includes('saved on server')
+          ? msg
+          : msg
+            ? `Upload failed: ${msg}`
+            : 'Could not upload file. Check your connection and try again.'
+      );
     }
     return;
   }
@@ -5193,12 +5236,27 @@ function setActiveView(view) {
     expense?.classList.remove('hidden');
     $('page-title').textContent = 'Expense management';
     $('page-meta').textContent = 'Bills by auditor — OCR, duplicate detection, Pass/Fail validation';
-    try {
-      renderExpenseView();
-      renderExpenseValidationStats();
-      renderClaimsList();
-    } catch (err) {
-      console.error('Expense view error:', err);
+    const paintExpense = () => {
+      try {
+        renderExpenseView();
+        renderExpenseValidationStats();
+        renderClaimsList();
+      } catch (err) {
+        console.error('Expense view error:', err);
+      }
+    };
+    if (USE_BACKEND && !STATE._claimsLoaded) {
+      reloadClaimsFromBackend()
+        .then(() => {
+          STATE._claimsLoaded = true;
+          paintExpense();
+        })
+        .catch((err) => {
+          console.warn('Claims load:', err);
+          paintExpense();
+        });
+    } else {
+      paintExpense();
     }
   } else {
     overview?.classList.remove('hidden');
