@@ -86,9 +86,21 @@ function findAuditor(nameStr, empCode, master, index) {
 }
 
 function parseLocation(loc) {
-  if (!loc || typeof loc !== 'string') return null;
-  const parts = loc.split(',').map((p) => parseFloat(p.trim()));
+  if (loc && typeof loc === 'object' && loc.lat != null && loc.lng != null) {
+    const lat = Number(loc.lat);
+    const lng = Number(loc.lng);
+    if (!Number.isNaN(lat) && !Number.isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) {
+      return { lat, lng };
+    }
+  }
+  if (loc == null) return null;
+  const s = String(loc).trim();
+  if (!s) return null;
+  const parts = s.split(/[,;]\s*/).map((p) => parseFloat(p.trim()));
   if (parts.length < 2 || Number.isNaN(parts[0]) || Number.isNaN(parts[1])) return null;
+  if (Math.abs(parts[0]) > 90 && Math.abs(parts[1]) <= 90) {
+    return { lat: parts[1], lng: parts[0] };
+  }
   return { lat: parts[0], lng: parts[1] };
 }
 

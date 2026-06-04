@@ -1633,7 +1633,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.20';
+const SENTINEL_BUILD = '2026.06.21';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1746,10 +1746,12 @@ function applyPjpAttendanceScope() {
 
 function applyAttendanceFromServer(data) {
   STATE.attendanceFileName = data.attendanceFileName || null;
-  const mapped = (data.rawRowsAll || data.rawRows || []).map((r) => ({
-    ...r,
-    date: r.date ? new Date(r.date) : null,
-  }));
+  const mapped = (data.rawRowsAll || data.rawRows || []).map((r) =>
+    hydrateAttendanceRow({
+      ...r,
+      date: r.date ? new Date(r.date) : null,
+    })
+  );
   STATE.rawRowsAll = mapped;
   STATE.attendanceRowCountTotal = data.rowCountTotal ?? mapped.length;
   applyPjpAttendanceScope();
@@ -2176,12 +2178,32 @@ function parseLocation(loc) {
   if (loc && typeof loc === 'object' && loc.lat != null && loc.lng != null) {
     const lat = Number(loc.lat);
     const lng = Number(loc.lng);
-    if (!isNaN(lat) && !isNaN(lng)) return { lat, lng };
+    if (!isNaN(lat) && !isNaN(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng };
   }
-  if (!loc || typeof loc !== 'string') return null;
-  const parts = loc.split(',').map(p => parseFloat(p.trim()));
+  if (loc == null) return null;
+  const s = String(loc).trim();
+  if (!s) return null;
+  const parts = s.split(/[,;]\s*/).map((p) => parseFloat(p.trim()));
   if (parts.length < 2 || isNaN(parts[0]) || isNaN(parts[1])) return null;
+  if (Math.abs(parts[0]) > 90 && Math.abs(parts[1]) <= 90) {
+    return { lat: parts[1], lng: parts[0] };
+  }
   return { lat: parts[0], lng: parts[1] };
+}
+
+/** Resolve GPS from attendance row (Location column or stored location object). */
+function rowAttendanceLocation(r) {
+  if (!r) return null;
+  const direct = parseLocation(r.location);
+  if (direct) return direct;
+  const raw = r.raw || r;
+  return parseLocation(raw['Location'] || raw.Location || raw.location || raw.GPS || raw.gps);
+}
+
+function hydrateAttendanceRow(r) {
+  if (!r) return r;
+  const location = rowAttendanceLocation(r);
+  return location ? { ...r, location } : r;
 }
 function parseExcelDate(v) {
   if (v == null) return null;
@@ -2805,7 +2827,7 @@ function updateDualSummary() {
 
 // Normalize one Excel row → canonical shape we can render
 function normalizeRow(r) {
-  const loc = parseLocation(r['Location']);
+  const loc = parseLocation(r['Location'] || r.Location || r.location);
   return {
     id: r['ID'],
     date: parseExcelDate(r['Choose Date'] || r['Date Collected']),
@@ -2903,16 +2925,24 @@ function refreshDashboard() {
   if (STATE.pjpEmpCodes && STATE.pjpEmpCodes.size > 0) {
     rowsOnDate = rowsOnDate.filter(r => {
       const m = findAuditor(r.auditor, r.auditorId);
-      return m && STATE.pjpEmpCodes.has(m.empCode);
+      return m && STATE.pjpEmpCodes.has(normalizeEmpCode(m.empCode));
     });
   }
-  STATE.dateFiltered = rowsOnDate;
+  STATE.dateFiltered = rowsOnDate.map(hydrateAttendanceRow);
   computeKPIs();
   renderFieldForceTable();
   renderMap();
   renderMapPjpPanel();
   if (STATE.mapSection === 'roster') renderPjpRosterTable();
   renderUnmatchedPanel();
+  requestAnimationFrame(() => {
+    setTimeout(() => {
+      if (STATE.map) {
+        STATE.map.invalidateSize();
+        renderMap();
+      }
+    }, 120);
+  });
   if (STATE.currentView === 'expense') renderExpenseView();
 }
 
@@ -3363,7 +3393,42 @@ function buildUpcomingMarketVisitMarkers(fromDate, days = UPCOMING_PJP_DAYS, emp
   );
 }
 
+/** Section 1: one marker per attendance submission on the selected date (GPS from Location). */
+function buildCurrentLocationEntries() {
+  const filter = $('map-filter')?.value || 'all';
+  return (STATE.dateFiltered || [])
+    .map((r) => {
+      const row = hydrateAttendanceRow(r);
+      const master = findAuditor(row.auditor, row.auditorId);
+      return {
+        master: master || {
+          empCode: row.auditorId || '',
+          name: row.auditor,
+          cluster: '—',
+          hometown: '',
+          lat: null,
+          lng: null,
+        },
+        code: normalizeEmpCode(master?.empCode || row.auditorId || ''),
+        auditorName: row.auditor || master?.name || 'Unknown',
+        onField: row.onField,
+        location: row.location || null,
+        absentReason: row.absentReason,
+        att: row,
+        noSubmission: false,
+      };
+    })
+    .filter((e) => {
+      if (filter === 'on_field') return e.onField === true;
+      if (filter === 'absent') return e.onField === false;
+      return true;
+    });
+}
+
 function buildMapAuditorEntries() {
+  if (STATE.mapSection !== 'roster') {
+    return buildCurrentLocationEntries();
+  }
   const focusCode = $('map-pjp-auditor')?.value || '';
   const filter = $('map-filter')?.value || 'all';
   const attByCode = {};
@@ -3659,6 +3724,10 @@ function renderPjpRosterTable() {
 
 function setMapSection(section) {
   STATE.mapSection = section === 'roster' ? 'roster' : 'current';
+  if (STATE.mapSection === 'current' && $('map-pjp-auditor')) {
+    $('map-pjp-auditor').value = '';
+    STATE.mapPjpSelectedAuditor = '';
+  }
   document.querySelectorAll('.map-tab').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.mapSection === STATE.mapSection);
   });
@@ -3763,25 +3832,10 @@ function renderMap() {
 /** Section 1: all auditors — current GPS (+ home base) for the selected date. */
 function renderMapCurrentSection() {
   const allPoints = [];
-  const entries = buildMapAuditorEntries();
-  entries.forEach((e) => {
+  const entries = buildCurrentLocationEntries();
+  const withGps = entries.filter((e) => e.location);
+  withGps.forEach((e) => {
     const baseName = e.master.hometown || '—';
-    if (e.master.lat != null && e.master.lng != null) {
-      const baseMarker = L.circleMarker([e.master.lat, e.master.lng], {
-        radius: 6,
-        fillColor: 'transparent',
-        color: '#fbbf24',
-        weight: 2,
-        opacity: 0.85,
-        fillOpacity: 0,
-      }).addTo(STATE.map);
-      baseMarker.bindPopup(
-        `<div style="font-family:Inter,sans-serif"><strong>🏠 ${escapeHtml(e.auditorName)}</strong><br>${escapeHtml(baseName)}</div>`
-      );
-      STATE.markers.push(baseMarker);
-      allPoints.push([e.master.lat, e.master.lng]);
-    }
-    if (!e.location) return;
     const currentColor = e.onField ? '#22c55e' : '#ef4444';
     const currentName =
       nearestCityName(e.location.lat, e.location.lng) ||
@@ -3810,7 +3864,20 @@ function renderMapCurrentSection() {
     `);
     STATE.markers.push(currentMarker);
     allPoints.push([e.location.lat, e.location.lng]);
-    if (e.master.lat != null) {
+    if (e.master.lat != null && e.master.lng != null) {
+      const baseMarker = L.circleMarker([e.master.lat, e.master.lng], {
+        radius: 5,
+        fillColor: 'transparent',
+        color: '#fbbf24',
+        weight: 2,
+        opacity: 0.75,
+        fillOpacity: 0,
+      }).addTo(STATE.map);
+      baseMarker.bindPopup(
+        `<div style="font-family:Inter,sans-serif"><strong>🏠 ${escapeHtml(e.auditorName)}</strong><br>${escapeHtml(baseName)}</div>`
+      );
+      STATE.markers.push(baseMarker);
+      allPoints.push([e.master.lat, e.master.lng]);
       const lineColor = distFromBase > 100 ? '#ef4444' : distFromBase > 25 ? '#f59e0b' : '#22c55e';
       const line = L.polyline(
         [
@@ -3824,6 +3891,15 @@ function renderMapCurrentSection() {
   });
   if (allPoints.length) {
     STATE.map.fitBounds(L.latLngBounds(allPoints), { padding: [48, 48], maxZoom: 7 });
+  } else if (STATE.map) {
+    STATE.map.setView([22.5, 79.0], 5);
+  }
+  const sub = $('map-sub');
+  if (sub) {
+    const dateStr = STATE.filteredDate
+      ? new Date(STATE.filteredDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
+      : '—';
+    sub.textContent = `Current locations · ${dateStr} · ${withGps.length} GPS on map · ${entries.length} submissions`;
   }
 }
 
