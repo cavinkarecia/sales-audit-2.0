@@ -968,13 +968,13 @@ html, body {
                 <div class="legend-item"><span class="legend-dot dot-on"></span> On Field (current)</div>
                 <div class="legend-item"><span class="legend-dot dot-absent"></span> Absent (current)</div>
                 <div class="legend-item"><span class="legend-dot dot-base"></span> Home Base</div>
-                <div class="legend-item"><span class="legend-dot dot-plan"></span> Planned (PJP)</div>
+                <div class="legend-item"><span class="legend-dot dot-plan"></span> Market Visit (PJP)</div>
                 <div class="legend-item"><span class="legend-line"></span> Base → Current / Plan path</div>
               </div>
             </div>
             <div id="map-pjp-section" class="map-pjp-section hidden">
-              <div class="panel-title" id="map-pjp-title" style="font-size:14px">30-day PJP plan</div>
-              <div class="panel-sub" id="map-pjp-sub">Planned locations by date</div>
+              <div class="panel-title" id="map-pjp-title" style="font-size:14px">PJP Market Visits</div>
+              <div class="panel-sub" id="map-pjp-sub">One map point per Market Visit (Work Type column)</div>
               <div class="map-pjp-table-wrap">
                 <table class="table" id="map-pjp-table">
                   <thead>
@@ -986,6 +986,7 @@ html, body {
                       <th>To (planned)</th>
                       <th>Kms</th>
                       <th>Hotel</th>
+                      <th>Map</th>
                     </tr>
                   </thead>
                   <tbody id="map-pjp-tbody"></tbody>
@@ -1605,7 +1606,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.15';
+const SENTINEL_BUILD = '2026.06.16';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1674,7 +1675,8 @@ function rebuildPlanIndexesFromRows(planRows) {
   for (const plan of planRows || []) {
     const dk = plan.dateKey || (plan.date ? dateKey(new Date(plan.date)) : null);
     if (!dk) continue;
-    if (plan.empCode) planByEmpDate[`${plan.empCode}|${dk}`] = plan;
+    const ec = normalizeEmpCode(plan.empCode);
+    if (ec) planByEmpDate[`${ec}|${dk}`] = plan;
     if (plan.empName) planByNameDate[`${normalizeName(plan.empName)}|${dk}`] = plan;
   }
   return { planByEmpDate, planByNameDate };
@@ -2531,7 +2533,7 @@ async function handleFile(file, kind) {
           if (!plan.date || (!plan.empCode && !plan.empName)) continue;
           STATE.planRows.push(plan);
           if (plan.empCode) {
-            STATE.planByEmpDate[`${plan.empCode}|${plan.dateKey}`] = plan;
+            STATE.planByEmpDate[`${normalizeEmpCode(plan.empCode)}|${plan.dateKey}`] = plan;
             STATE.pjpEmpCodes.add(plan.empCode);
           }
           if (plan.empName) {
@@ -3085,41 +3087,110 @@ function renderFieldForceTable() {
 });
 
 // =================================================================
-// MAP — PJP 30-day plan by auditor
+// MAP — PJP Market Visits by auditor (Work Type column)
 // =================================================================
-function getMapPlanWindowEnd() {
-  if (STATE.filteredDate) {
-    const d = new Date(STATE.filteredDate + 'T12:00:00');
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-  if (STATE.pjpMaxDate) return new Date(STATE.pjpMaxDate);
-  return new Date();
+function normalizeEmpCode(code) {
+  return code != null ? String(code).replace(/\.0$/, '').trim() : '';
 }
 
-/** Last 30 calendar days (inclusive) of PJP plan rows for one auditor. */
-function buildAuditorPlanDays(empCode, dayCount = 30) {
+function isMarketVisitWorkType(workType) {
+  return workType && /market\s*visit/i.test(String(workType).trim());
+}
+
+function resolvePlanVisitCoords(plan) {
+  if (!plan) return null;
+  for (const town of [plan.toTown, plan.fromTown]) {
+    if (!town) continue;
+    const c = resolveCityCoords(town);
+    if (c) return { ...c, town };
+  }
+  return null;
+}
+
+/** Slight offset so stacked same-city visits remain visible as separate points. */
+function offsetCoordsForVisitIndex(lat, lng, index) {
+  const ring = Math.floor(index / 8);
+  const slot = index % 8;
+  const angle = (slot / 8) * 2 * Math.PI;
+  const km = 0.015 + ring * 0.012;
+  const dLat = km / 111;
+  const dLng = km / (111 * Math.cos((lat * Math.PI) / 180));
+  return { lat: lat + dLat * Math.cos(angle), lng: lng + dLng * Math.sin(angle) };
+}
+
+/** All PJP plan rows for this auditor within the loaded PJP month. */
+function buildAuditorPlanRowsInPjpMonth(empCode) {
   if (!empCode || !STATE.planRows.length) return [];
-  const end = getMapPlanWindowEnd();
-  const start = new Date(end);
-  start.setDate(start.getDate() - (dayCount - 1));
+  const code = normalizeEmpCode(empCode);
+  const min = STATE.pjpMinDate ? dateKey(STATE.pjpMinDate) : null;
+  const max = STATE.pjpMaxDate ? dateKey(STATE.pjpMaxDate) : null;
+  return STATE.planRows
+    .filter((p) => {
+      if (normalizeEmpCode(p.empCode) !== code) return false;
+      if (!p.dateKey) return false;
+      if (min && max) return p.dateKey >= min && p.dateKey <= max;
+      return true;
+    })
+    .sort((a, b) => a.dateKey.localeCompare(b.dateKey) || String(a.sheet || '').localeCompare(String(b.sheet || '')));
+}
+
+function planRowToMapDay(plan, visitIndex = 0) {
+  const d = plan.date ? new Date(plan.date) : new Date(`${plan.dateKey}T12:00:00`);
+  const geo = resolvePlanVisitCoords(plan);
+  let plannedCoords = null;
+  if (geo) {
+    plannedCoords = offsetCoordsForVisitIndex(geo.lat, geo.lng, visitIndex);
+    plannedCoords.town = geo.town;
+  }
+  return {
+    dateKey: plan.dateKey,
+    dateLabel: d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+    day: d.toLocaleDateString('en-IN', { weekday: 'short' }),
+    plan,
+    fromTown: plan.fromTown || null,
+    plannedTown: plan.toTown || null,
+    workType: plan.workType || null,
+    kms: plan.kms ?? null,
+    hotelStay: plan.hotelStay ?? null,
+    plannedCoords,
+    isMarketVisit: isMarketVisitWorkType(plan.workType),
+    visitIndex,
+  };
+}
+
+/** One entry per PJP row where Work Type = Market Visit (map point count must match). */
+function buildAuditorMarketVisits(empCode) {
+  const rows = buildAuditorPlanRowsInPjpMonth(empCode).filter((p) => isMarketVisitWorkType(p.workType));
+  return rows.map((plan, i) => planRowToMapDay(plan, i));
+}
+
+/** Full PJP month calendar (all work types) for the table. */
+function buildAuditorPlanMonthDays(empCode) {
+  if (!STATE.pjpMinDate || !STATE.pjpMaxDate) {
+    return buildAuditorPlanRowsInPjpMonth(empCode).map((plan, i) => planRowToMapDay(plan, i));
+  }
   const days = [];
-  const cursor = new Date(start);
+  const cursor = new Date(STATE.pjpMinDate);
+  const end = new Date(STATE.pjpMaxDate);
+  let visitIdx = 0;
   while (cursor <= end) {
     const dKey = dateKey(cursor);
-    const plan = STATE.planByEmpDate[`${empCode}|${dKey}`] || null;
-    const toTown = plan?.toTown || null;
-    days.push({
+    const plan = STATE.planByEmpDate[`${normalizeEmpCode(empCode)}|${dKey}`] || null;
+    const row = plan ? planRowToMapDay(plan, isMarketVisitWorkType(plan.workType) ? visitIdx++ : 0) : {
       dateKey: dKey,
       dateLabel: cursor.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
       day: cursor.toLocaleDateString('en-IN', { weekday: 'short' }),
-      plan,
-      fromTown: plan?.fromTown || null,
-      plannedTown: toTown,
-      workType: plan?.workType || null,
-      kms: plan?.kms ?? null,
-      hotelStay: plan?.hotelStay ?? null,
-      plannedCoords: toTown ? resolveCityCoords(toTown) : null,
-    });
+      plan: null,
+      fromTown: null,
+      plannedTown: null,
+      workType: null,
+      kms: null,
+      hotelStay: null,
+      plannedCoords: null,
+      isMarketVisit: false,
+      visitIndex: 0,
+    };
+    days.push(row);
     cursor.setDate(cursor.getDate() + 1);
   }
   return days;
@@ -3165,9 +3236,9 @@ function clearMapPjpOverlay() {
   STATE.mapPjpLines = [];
 }
 
-function renderMapPjpOnMap(master, days) {
+function renderMapPjpOnMap(master, marketVisits) {
   clearMapPjpOverlay();
-  if (!master || !days.length) return;
+  if (!master || !marketVisits.length) return;
   initMap();
   const allBounds = [];
   if (master.lat != null && master.lng != null) {
@@ -3186,40 +3257,37 @@ function renderMapPjpOnMap(master, days) {
     allBounds.push([master.lat, master.lng]);
   }
   const path = [];
-  days.forEach((d) => {
+  marketVisits.forEach((d, idx) => {
     if (!d.plannedCoords) return;
     const m = L.circleMarker([d.plannedCoords.lat, d.plannedCoords.lng], {
-      radius: 5,
+      radius: 6,
       fillColor: '#a855f7',
       color: '#0a0e1a',
       weight: 1,
       opacity: 1,
-      fillOpacity: 0.9,
+      fillOpacity: 0.92,
     }).addTo(STATE.map);
     const route =
       d.fromTown && d.plannedTown && d.fromTown !== d.plannedTown
         ? `${escapeHtml(d.fromTown)} → ${escapeHtml(d.plannedTown)}`
-        : escapeHtml(d.plannedTown || '—');
+        : escapeHtml(d.plannedTown || d.fromTown || '—');
     m.bindPopup(`
       <div style="font-family:Inter,sans-serif;min-width:200px">
-        <div style="font-weight:600;color:#0a0e1a">${escapeHtml(d.dateLabel)} (${escapeHtml(d.day)})</div>
+        <div style="font-weight:600;color:#0a0e1a">Market Visit #${idx + 1} · ${escapeHtml(d.dateLabel)}</div>
+        <div style="font-size:10px;color:#9ca3af">${escapeHtml(d.day)}</div>
         <div style="font-size:11px;color:#6b7280;margin-top:4px">📋 ${route}</div>
-        ${d.workType ? `<div style="font-size:11px;color:#6b7280">${escapeHtml(d.workType)}</div>` : ''}
         ${d.kms != null ? `<div style="font-size:11px;color:#6b7280">${d.kms} km</div>` : ''}
       </div>
     `);
     STATE.mapPjpMarkers.push(m);
-    const last = path[path.length - 1];
-    if (!last || last[0] !== d.plannedCoords.lat || last[1] !== d.plannedCoords.lng) {
-      path.push([d.plannedCoords.lat, d.plannedCoords.lng]);
-    }
+    path.push([d.plannedCoords.lat, d.plannedCoords.lng]);
     allBounds.push([d.plannedCoords.lat, d.plannedCoords.lng]);
   });
   if (path.length > 1) {
     const line = L.polyline(path, {
       color: '#a855f7',
       weight: 2,
-      opacity: 0.55,
+      opacity: 0.45,
       dashArray: '6, 4',
     }).addTo(STATE.map);
     STATE.mapPjpLines.push(line);
@@ -3239,40 +3307,52 @@ function renderMapPjpPanel() {
     clearMapPjpOverlay();
     return;
   }
-  const master = AUDITOR_MASTER.find((a) => a.empCode === empCode);
-  const days = buildAuditorPlanDays(empCode, 30);
-  const plannedCount = days.filter((d) => d.plannedTown).length;
-  const end = getMapPlanWindowEnd();
-  const start = new Date(end);
-  start.setDate(start.getDate() - 29);
-  const rangeLabel = `${start.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })} – ${end.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`;
+  const master = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(empCode));
+  const marketVisits = buildAuditorMarketVisits(empCode);
+  const marketVisitTotal = marketVisits.length;
+  const onMap = marketVisits.filter((d) => d.plannedCoords).length;
+  const missingGeo = marketVisitTotal - onMap;
+  const rangeLabel = STATE.pjpMonth
+    ? STATE.pjpMonth.label
+    : STATE.pjpMinDate && STATE.pjpMaxDate
+      ? `${dateKey(STATE.pjpMinDate)} – ${dateKey(STATE.pjpMaxDate)}`
+      : 'PJP month';
 
   section.classList.remove('hidden');
   $('map-pjp-title').textContent = master
-    ? `${master.name} — 30-day planned locations`
-    : `${empCode} — 30-day planned locations`;
-  $('map-pjp-sub').textContent = `${rangeLabel} · ${plannedCount} days with a planned town · purple markers on map`;
+    ? `${master.name} — ${marketVisitTotal} Market Visit${marketVisitTotal === 1 ? '' : 's'}`
+    : `${empCode} — ${marketVisitTotal} Market Visits`;
+  let sub = `${rangeLabel} · ${onMap} point${onMap === 1 ? '' : 's'} on map (= Market Visit count from Work Type)`;
+  if (missingGeo > 0) {
+    sub += ` · ${missingGeo} visit${missingGeo === 1 ? '' : 's'} missing town coordinates`;
+  }
+  $('map-pjp-sub').textContent = sub;
 
-  tbody.innerHTML = days
-    .map((d) => {
-      const hasPlan = !!(d.plannedTown || d.workType);
-      const hotel =
-        d.hotelStay === true ? 'Yes' : d.hotelStay === false ? 'No' : '—';
-      return `
-      <tr class="${hasPlan ? '' : 'text-dim'}">
+  tbody.innerHTML = marketVisits.length
+    ? marketVisits
+        .map((d, i) => {
+          const hotel =
+            d.hotelStay === true ? 'Yes' : d.hotelStay === false ? 'No' : '—';
+          const mapOk = d.plannedCoords
+            ? '<span class="pill pill-on">On map</span>'
+            : '<span class="pill pill-off">No coords</span>';
+          return `
+      <tr>
         <td>${escapeHtml(d.dateLabel)}</td>
         <td>${escapeHtml(d.day)}</td>
-        <td>${escapeHtml(d.workType || '—')}</td>
+        <td><strong>${escapeHtml(d.workType || 'Market Visit')}</strong></td>
         <td>${escapeHtml(d.fromTown || '—')}</td>
-        <td><strong>${escapeHtml(d.plannedTown || '—')}</strong></td>
+        <td><strong>${escapeHtml(d.plannedTown || d.fromTown || '—')}</strong></td>
         <td>${d.kms != null ? escapeHtml(String(d.kms)) : '—'}</td>
         <td>${hotel}</td>
+        <td>${mapOk}</td>
       </tr>
     `;
-    })
-    .join('');
+        })
+        .join('')
+    : `<tr><td colspan="8" class="table-empty">No Market Visit rows for this auditor in ${escapeHtml(rangeLabel)}.</td></tr>`;
 
-  renderMapPjpOnMap(master, days);
+  renderMapPjpOnMap(master, marketVisits);
 }
 
 $('map-pjp-auditor')?.addEventListener('change', () => {
@@ -3387,7 +3467,7 @@ function renderMap() {
 
   if (STATE.mapPjpSelectedAuditor && STATE.planRows.length) {
     const master = AUDITOR_MASTER.find((a) => a.empCode === STATE.mapPjpSelectedAuditor);
-    renderMapPjpOnMap(master, buildAuditorPlanDays(STATE.mapPjpSelectedAuditor, 30));
+    renderMapPjpOnMap(master, buildAuditorMarketVisits(STATE.mapPjpSelectedAuditor));
   } else if (allPoints.length) {
     const group = L.featureGroup(STATE.markers);
     STATE.map.fitBounds(group.getBounds().pad(0.15), { maxZoom: 7 });
