@@ -1560,7 +1560,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.11';
+const SENTINEL_BUILD = '2026.06.12';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -4501,19 +4501,37 @@ $('claim-submit').addEventListener('click', async () => {
       await ensureBackendSession();
       const resp = await apiFetch('/api/claims', {
         method: 'POST',
-        body: JSON.stringify(claim),
+        body: JSON.stringify({
+          ...claim,
+          submittedAt: claim.submittedAt instanceof Date ? claim.submittedAt.toISOString() : claim.submittedAt,
+        }),
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) {
-        alert(data.error || 'Could not save claim.');
+        alert(data.error || `Could not save claim (HTTP ${resp.status}). Server may be overloaded — try again in a minute.`);
         return;
       }
-      STATE.claims.unshift(data.claim);
+      const saved = data.claim || data;
+      STATE.claims.unshift(saved);
+      STATE._claimsLoaded = true;
       renderClaimsList();
       renderExpenseValidationStats();
+      if (data.verifySuggested && saved.billDataUrl) {
+        verifyClaimWithAI(saved)
+          .then(() => {
+            mergeAiVerdict(saved);
+            renderClaimsList();
+            renderExpenseValidationStats();
+          })
+          .catch((err) => {
+            console.warn('Bill verify:', err);
+            saved.aiError = err.message;
+            renderClaimsList();
+          });
+      }
     } catch (err) {
       console.error(err);
-      alert('Could not submit claim. Try again.');
+      alert(err?.message || 'Could not submit claim. Check connection and try again.');
     }
     resetBillUpload();
     return;
@@ -4681,8 +4699,8 @@ async function verifyClaimWithAI(claim) {
   if (USE_BACKEND) {
     const resp = await apiFetch(`/api/claims/${encodeURIComponent(claim.id)}/verify`, { method: 'POST' });
     const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || 'Verification failed');
-    Object.assign(claim, data.claim);
+    if (!resp.ok) throw new Error(data.error || `Verification failed (HTTP ${resp.status})`);
+    Object.assign(claim, data.claim || data);
     return claim.aiResult;
   }
 
@@ -5178,9 +5196,15 @@ function getReasonPillClass(reason) {
 
 function setupDrillTabs(tabs) {
   const content = $('drill-content');
+  if (!tabs?.length || !content) return;
   function render(idx) {
     document.querySelectorAll('#drawer .tab').forEach((t, i) => t.classList.toggle('active', i === idx));
-    content.innerHTML = renderDrillRows(tabs[idx].rows, tabs[idx].type);
+    const tab = tabs[idx];
+    if (!tab?.rows) {
+      content.innerHTML = '<div class="table-empty" style="padding:40px">No records for this tab.</div>';
+      return;
+    }
+    content.innerHTML = renderDrillRows(tab.rows, tab.type);
   }
   document.querySelectorAll('#drawer .tab').forEach((t, i) => {
     t.addEventListener('click', () => render(i));

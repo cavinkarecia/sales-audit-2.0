@@ -330,7 +330,7 @@ function buildStateSummaryPayload(summary, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.11-main' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.12-main' });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -574,12 +574,19 @@ app.post('/api/upload/pjp', authRequired, upload.single('file'), async (req, res
 
 // --- Claims ---
 
+async function loadSessionClaims(sessionId) {
+  const { rows } = await getPool().query(
+    'SELECT payload FROM claims WHERE session_id = $1 ORDER BY created_at DESC',
+    [sessionId]
+  );
+  return rows.map((r) => slimClaimForClient(r.payload));
+}
+
 app.get('/api/claims', authRequired, async (req, res) => {
   try {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
-    const workspace = await loadWorkspace(sessionId);
-    res.json({ claims: workspace.claims.map(slimClaimForClient) });
+    res.json({ claims: await loadSessionClaims(sessionId) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -647,7 +654,7 @@ app.post('/api/claims', authRequired, async (req, res) => {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
 
-    const workspace = await loadWorkspace(sessionId);
+    const workspace = await loadWorkspaceLite(sessionId);
     const claim = {
       ...req.body,
       id: req.body.id || `CL-${Date.now().toString(36).toUpperCase()}`,
@@ -657,7 +664,11 @@ app.post('/api/claims', authRequired, async (req, res) => {
       concerns: [],
     };
 
-    await processClaim(claim, workspace, sessionId, { apiKey: getClientApiKey(req) });
+    const apiKey = getClientApiKey(req);
+    const isImage =
+      claim.billDataUrl && claim.billMimeType && String(claim.billMimeType).startsWith('image/');
+    // Save quickly with rules/registry only — AI/OCR runs via /verify (avoids Render 502 timeouts).
+    await processClaim(claim, workspace, sessionId, { apiKey, skipAi: true });
 
     await ensureSession(sessionId);
     await getPool().query(
@@ -666,7 +677,11 @@ app.post('/api/claims', authRequired, async (req, res) => {
       [claim.id, sessionId, JSON.stringify(claim)]
     );
 
-    res.status(201).json({ claim });
+    const clientClaim = {
+      ...slimClaimForClient(claim),
+      billDataUrl: claim.billDataUrl || null,
+    };
+    res.status(201).json({ claim: clientClaim, verifySuggested: !!(isImage && apiKey) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Failed to save claim' });
@@ -678,7 +693,7 @@ app.post('/api/claims/:id/verify', authRequired, async (req, res) => {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
 
-    const workspace = await loadWorkspace(sessionId);
+    const workspace = await loadWorkspaceLite(sessionId);
     const row = await getPool().query(
       'SELECT payload FROM claims WHERE id = $1 AND session_id = $2',
       [req.params.id, sessionId]
@@ -698,7 +713,12 @@ app.post('/api/claims/:id/verify', authRequired, async (req, res) => {
       [JSON.stringify(claim), claim.id, sessionId]
     );
 
-    res.json({ claim });
+    res.json({
+      claim: {
+        ...slimClaimForClient(claim),
+        billDataUrl: claim.billDataUrl || null,
+      },
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Verification failed' });
@@ -726,26 +746,31 @@ app.get('/api/expense/stats', authRequired, async (req, res) => {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
     const pool = getPool();
-    const registry = await loadExpenseRegistry(pool);
     const { rows: claimRows } = await pool.query(
-      'SELECT payload FROM claims WHERE session_id = $1',
+      `SELECT payload->>'verdict' AS verdict, payload->'validation' AS validation
+       FROM claims WHERE session_id = $1`,
       [sessionId]
     );
-    const claims = claimRows.map((r) => r.payload);
-    const flagged = claims.filter((c) =>
-      ['suspicious', 'collusion', 'review'].includes(c.verdict)
-    ).length;
-    const collusion = claims.filter((c) => c.verdict === 'collusion').length;
-    const lowOcr = claims.filter(
-      (c) => c.validation?.flags?.some((f) => f.code === 'LOW_OCR_CONFIDENCE')
-    ).length;
+    const { rows: regCount } = await pool.query('SELECT COUNT(*)::int AS n FROM expense_claim_registry');
+    let flagged = 0;
+    let collusion = 0;
+    let lowOcr = 0;
+    let pending = 0;
+    for (const r of claimRows) {
+      const v = r.verdict;
+      if (v === 'pending') pending += 1;
+      if (['suspicious', 'collusion', 'review'].includes(v)) flagged += 1;
+      if (v === 'collusion') collusion += 1;
+      const flags = r.validation?.flags;
+      if (Array.isArray(flags) && flags.some((f) => f.code === 'LOW_OCR_CONFIDENCE')) lowOcr += 1;
+    }
     res.json({
-      totalClaims: claims.length,
-      registrySize: registry.length,
+      totalClaims: claimRows.length,
+      registrySize: regCount[0]?.n || 0,
       flagged,
       collusion,
       lowOcr,
-      pending: claims.filter((c) => c.verdict === 'pending').length,
+      pending,
     });
   } catch (err) {
     console.error(err);
