@@ -1605,7 +1605,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.14';
+const SENTINEL_BUILD = '2026.06.15';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1680,11 +1680,47 @@ function rebuildPlanIndexesFromRows(planRows) {
   return { planByEmpDate, planByNameDate };
 }
 
+function filterAttendanceToPjpMonth(rows) {
+  if (!rows?.length || !STATE.pjpMinDate || !STATE.pjpMaxDate) return rows || [];
+  const min = dateKey(STATE.pjpMinDate);
+  const max = dateKey(STATE.pjpMaxDate);
+  return rows.filter((r) => {
+    if (!r.date) return false;
+    const dk = dateKey(r.date instanceof Date ? r.date : new Date(r.date));
+    return dk >= min && dk <= max;
+  });
+}
+
+/** Use only attendance rows in the PJP month (e.g. April 2026) when PJP is loaded. */
+function applyPjpAttendanceScope() {
+  const all = (STATE.rawRowsAll?.length ? STATE.rawRowsAll : STATE.rawRows) || [];
+  const mapped = all.map((r) => ({
+    ...r,
+    date: r.date ? (r.date instanceof Date ? r.date : new Date(r.date)) : null,
+  }));
+  STATE.rawRowsAll = mapped;
+  STATE.attendanceRowCountTotal = mapped.length;
+  if (STATE.pjpMinDate && STATE.pjpMaxDate) {
+    STATE.rawRows = filterAttendanceToPjpMonth(mapped);
+  } else {
+    STATE.rawRows = mapped;
+  }
+  STATE.attendanceRowCount = STATE.rawRows.length;
+  STATE.uniqueAuditors = [...new Set(STATE.rawRows.map((r) => r.auditor).filter(Boolean))].sort();
+}
+
 function applyAttendanceFromServer(data) {
   STATE.attendanceFileName = data.attendanceFileName || null;
-  STATE.rawRows = (data.rawRows || []).map(r => ({ ...r, date: r.date ? new Date(r.date) : null }));
-  STATE.uniqueAuditors = data.uniqueAuditors || [...new Set(STATE.rawRows.map(r => r.auditor).filter(Boolean))].sort();
-  STATE.attendanceRowCount = STATE.rawRows.length;
+  const mapped = (data.rawRowsAll || data.rawRows || []).map((r) => ({
+    ...r,
+    date: r.date ? new Date(r.date) : null,
+  }));
+  STATE.rawRowsAll = mapped;
+  STATE.attendanceRowCountTotal = data.rowCountTotal ?? mapped.length;
+  applyPjpAttendanceScope();
+  if (data.uniqueAuditors && !STATE.pjpMinDate) {
+    STATE.uniqueAuditors = data.uniqueAuditors;
+  }
 }
 
 function applyPjpFromServer(data) {
@@ -1698,6 +1734,9 @@ function applyPjpFromServer(data) {
   const planIdx = rebuildPlanIndexesFromRows(STATE.planRows);
   STATE.planByEmpDate = planIdx.planByEmpDate;
   STATE.planByNameDate = planIdx.planByNameDate;
+  if (STATE.rawRowsAll.length || STATE.attendanceFileName) {
+    applyPjpAttendanceScope();
+  }
 }
 
 function applyStateFromServer(data) {
@@ -1737,6 +1776,9 @@ function applyStateFromServer(data) {
   if (STATE.filteredDate) $('date-filter').value = STATE.filteredDate;
   if (STATE.pjpMinDate) $('date-filter').min = dateKey(STATE.pjpMinDate);
   if (STATE.pjpMaxDate) $('date-filter').max = dateKey(STATE.pjpMaxDate);
+  if (STATE.rawRowsAll.length || STATE.attendanceFileName) {
+    applyPjpAttendanceScope();
+  }
 }
 
 async function loadAttendanceFromBackend() {
@@ -1822,7 +1864,7 @@ async function reloadWorkspaceAfterUpload(kind, data) {
   if (kind === 'attendance') {
     await loadAttendanceFromBackend();
     STATE.attendanceFileName = data.attendanceFileName || STATE.attendanceFileName;
-    STATE.attendanceRowCount = data.rowCount || STATE.rawRows.length;
+    applyPjpAttendanceScope();
   } else {
     await loadPjpFromBackend();
     STATE.pjpFileName = data.pjpFileName || STATE.pjpFileName;
@@ -2028,6 +2070,8 @@ function findAuditor(nameStr, empCode) {
 const STATE = {
   // Attendance (actual on-ground data)
   rawRows: [],
+  rawRowsAll: [],
+  attendanceRowCountTotal: 0,
   filteredDate: null,
   dateFiltered: [],
   uniqueAuditors: [],
@@ -2451,14 +2495,14 @@ async function handleFile(file, kind) {
       const ws = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
       if (!rows.length) { alert('The attendance file appears empty.'); return; }
-      STATE.rawRows = rows.map(normalizeRow);
-      STATE.uniqueAuditors = [...new Set(STATE.rawRows.map(r => r.auditor).filter(Boolean))].sort();
+      STATE.rawRowsAll = rows.map(normalizeRow);
       STATE.attendanceFileName = file.name;
+      applyPjpAttendanceScope();
 
       // Pick default date: latest attendance date that falls within PJP month if loaded,
       // otherwise just the latest attendance date.
       let defaultDate = null;
-      const allDates = STATE.rawRows.map(r => r.date).filter(Boolean);
+      const allDates = STATE.rawRows.map((r) => r.date).filter(Boolean);
       if (STATE.pjpMinDate && STATE.pjpMaxDate) {
         const inRange = allDates.filter(d => d >= STATE.pjpMinDate && d <= STATE.pjpMaxDate);
         if (inRange.length) {
@@ -2522,6 +2566,10 @@ async function handleFile(file, kind) {
         const dateInput = $('date-filter');
         dateInput.min = dateKey(STATE.pjpMinDate);
         dateInput.max = dateKey(STATE.pjpMaxDate);
+      }
+
+      if (STATE.rawRowsAll.length) {
+        applyPjpAttendanceScope();
       }
 
       // If attendance is already loaded, re-pick the default date to be the latest
@@ -2598,11 +2646,19 @@ function parseYesNo(v) {
   return null;
 }
 
+function attendanceScopeLabel() {
+  const total = STATE.attendanceRowCountTotal || STATE.rawRowsAll?.length || 0;
+  const scoped = STATE.rawRows.length || 0;
+  if (STATE.pjpMonth && total > scoped) {
+    return `${scoped} rows (${STATE.pjpMonth.label})`;
+  }
+  return `${scoped} rows`;
+}
+
 function updateFileChips() {
   if (STATE.attendanceFileName) {
     $('chip-attendance').classList.add('loaded');
-    const attN = STATE.rawRows.length || STATE.attendanceRowCount || 0;
-    $('chip-attendance-status').textContent = `${attN} rows`;
+    $('chip-attendance-status').textContent = attendanceScopeLabel();
   } else {
     $('chip-attendance').classList.remove('loaded');
     $('chip-attendance-status').textContent = 'Not loaded';
@@ -2626,9 +2682,13 @@ function updateDualSummary() {
 
   if (STATE.attendanceFileName) {
     summaryAtt.classList.remove('dual-empty');
-    let meta = `${escapeHtml(STATE.attendanceFileName)} · ${STATE.rawRows.length.toLocaleString()} rows`;
+    const total = STATE.attendanceRowCountTotal || STATE.rawRowsAll?.length || STATE.rawRows.length;
+    let meta = `${escapeHtml(STATE.attendanceFileName)} · ${STATE.rawRows.length.toLocaleString()} rows in scope`;
+    if (STATE.pjpMonth && total > STATE.rawRows.length) {
+      meta += ` <span class="text-dim">(${total.toLocaleString()} total in file · using ${escapeHtml(STATE.pjpMonth.label)} only)</span>`;
+    }
     if (STATE.pjpEmpCodes.size > 0) {
-      // PJP loaded — count how many PJP auditors submitted attendance ever
+      // PJP loaded — count how many PJP auditors submitted attendance in scope month
       const submittedEmpCodes = new Set();
       for (const r of STATE.rawRows) {
         const m = findAuditor(r.auditor, r.auditorId);
@@ -2702,6 +2762,8 @@ $('reset-btn').addEventListener('click', async () => {
     }
   }
   STATE.rawRows = [];
+  STATE.rawRowsAll = [];
+  STATE.attendanceRowCountTotal = 0;
   STATE.uniqueAuditors = [];
   STATE.dateFiltered = [];
   STATE.filteredDate = null;
@@ -2908,7 +2970,11 @@ function computeKPIs() {
 
   const dateStr = STATE.filteredDate ? new Date(STATE.filteredDate).toLocaleDateString('en-IN', { day:'numeric', month:'long', year:'numeric' }) : '—';
   const universe = pjpSize ? `${pjpSize} PJP auditors` : `${rows.length} reported`;
-  $('page-meta').textContent = `${dateStr} · ${universe} · ${STATE.pjpMonth ? STATE.pjpMonth.label + ' view' : 'all dates'}`;
+  let scopeNote = '';
+  if (STATE.pjpMonth && STATE.attendanceRowCountTotal > STATE.rawRows.length) {
+    scopeNote = ` · attendance scoped to ${STATE.pjpMonth.label} (${STATE.rawRows.length}/${STATE.attendanceRowCountTotal} rows)`;
+  }
+  $('page-meta').textContent = `${dateStr} · ${universe} · ${STATE.pjpMonth ? STATE.pjpMonth.label + ' PJP month' : 'all dates'}${scopeNote}`;
   $('map-sub').textContent = `${present.length} auditors on field · ${absent.length} absent${notSubmitted ? ` · ${notSubmitted} no submission` : ''}`;
   $('ff-sub').textContent = `${rows.length} of ${total} ${pjpSize ? 'PJP' : ''} auditors reported for ${dateStr}`;
 }

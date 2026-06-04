@@ -140,6 +140,18 @@ function buildPlanIndexes(planRows) {
   return { planByEmpDate, planByNameDate };
 }
 
+/** Keep only attendance rows whose date falls within the PJP month window. */
+function scopeAttendanceToPjpMonth(rows, pjpMinDate, pjpMaxDate) {
+  if (!rows?.length || !pjpMinDate || !pjpMaxDate) return rows || [];
+  const min = String(pjpMinDate).slice(0, 10);
+  const max = String(pjpMaxDate).slice(0, 10);
+  return rows.filter((r) => {
+    if (!r.date) return false;
+    const dk = String(r.date).slice(0, 10);
+    return dk >= min && dk <= max;
+  });
+}
+
 function pickDefaultDate(rawRows, pjpMinDate, pjpMaxDate) {
   const allDates = rawRows.map((r) => (r.date ? new Date(r.date) : null)).filter(Boolean);
   if (pjpMinDate && pjpMaxDate) {
@@ -160,4 +172,5 @@ module.exports = {
   parsePjpBuffer,
   buildPlanIndexes,
   pickDefaultDate,
+  scopeAttendanceToPjpMonth,
 };

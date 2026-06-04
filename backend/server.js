@@ -11,7 +11,13 @@ const cookieParser = require('cookie-parser');
 
 const { initDb, getPool, ensureSession } = require('./db');
 const AUDITOR_MASTER = require('./data/auditors');
-const { parseAttendanceBuffer, parsePjpBuffer, buildPlanIndexes, pickDefaultDate } = require('./lib/excel');
+const {
+  parseAttendanceBuffer,
+  parsePjpBuffer,
+  buildPlanIndexes,
+  pickDefaultDate,
+  scopeAttendanceToPjpMonth,
+} = require('./lib/excel');
 const { dateKey } = require('./lib/utils');
 const { rosterAiReview } = require('./lib/claims');
 const { processClaim } = require('./lib/claim-processor');
@@ -180,15 +186,18 @@ async function loadWorkspace(sessionId) {
     [sessionId]
   );
 
-  const rawRows = att.rows[0]?.rows || [];
+  const rawRowsAll = att.rows[0]?.rows || [];
   const planRows = pjp.rows[0]?.plan_rows || [];
   const meta = pjp.rows[0]?.meta || {};
   const indexes = buildPlanIndexes(planRows);
+  const rawRows = scopeAttendanceToPjpMonth(rawRowsAll, meta.pjpMinDate, meta.pjpMaxDate);
 
   return {
     attendanceFileName: att.rows[0]?.filename || null,
     pjpFileName: pjp.rows[0]?.filename || null,
     rawRows,
+    rawRowsAll,
+    attendanceRowCountTotal: rawRowsAll.length,
     planRows,
     pjpMonth: meta.pjpMonth || null,
     pjpMinDate: meta.pjpMinDate || null,
@@ -213,10 +222,11 @@ async function loadWorkspaceLite(sessionId) {
     'SELECT filename, plan_rows, meta FROM pjp_snapshots WHERE session_id = $1',
     [sessionId]
   );
-  const rawRows = att.rows[0]?.rows || [];
+  const rawRowsAll = att.rows[0]?.rows || [];
   const planRows = pjp.rows[0]?.plan_rows || [];
   const meta = pjp.rows[0]?.meta || {};
   const indexes = buildPlanIndexes(planRows);
+  const rawRows = scopeAttendanceToPjpMonth(rawRowsAll, meta.pjpMinDate, meta.pjpMaxDate);
   const slimClaims = await loadSlimClaimRows(sessionId, 500);
 
   return {
@@ -329,7 +339,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.06.14-main',
+    build: '2026.06.15-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -424,13 +434,28 @@ app.get('/api/attendance', authRequired, async (req, res) => {
       'SELECT filename, rows FROM attendance_snapshots WHERE session_id = $1',
       [sessionId]
     );
-    if (!rows.length) return res.json({ attendanceFileName: null, rawRows: [], uniqueAuditors: [] });
-    const rawRows = rows[0].rows || [];
+    if (!rows.length) {
+      return res.json({
+        attendanceFileName: null,
+        rawRows: [],
+        rawRowsAll: [],
+        uniqueAuditors: [],
+        rowCountTotal: 0,
+        rowCountInScope: 0,
+      });
+    }
+    const meta = await getPjpMeta(sessionId);
+    const rawRowsAll = rows[0].rows || [];
+    const rawRows = scopeAttendanceToPjpMonth(rawRowsAll, meta.pjpMinDate, meta.pjpMaxDate);
     const uniqueAuditors = [...new Set(rawRows.map((r) => r.auditor).filter(Boolean))].sort();
     res.json({
       attendanceFileName: rows[0].filename,
       rawRows,
+      rawRowsAll,
       uniqueAuditors,
+      rowCountTotal: rawRowsAll.length,
+      rowCountInScope: rawRows.length,
+      pjpMonth: meta.pjpMonth || null,
     });
   } catch (err) {
     console.error(err);
@@ -495,11 +520,14 @@ async function getPjpMeta(sessionId) {
   return res.rows[0]?.meta || {};
 }
 
-async function getAttendanceRowsForSession(sessionId) {
+async function getAttendanceRowsForSession(sessionId, scoped = true) {
   const res = await getPool().query('SELECT rows FROM attendance_snapshots WHERE session_id = $1', [
     sessionId,
   ]);
-  return res.rows[0]?.rows || [];
+  const all = res.rows[0]?.rows || [];
+  if (!scoped) return all;
+  const meta = await getPjpMeta(sessionId);
+  return scopeAttendanceToPjpMonth(all, meta.pjpMinDate, meta.pjpMaxDate);
 }
 
 // --- Uploads ---
