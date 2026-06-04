@@ -213,7 +213,7 @@ async function loadExpenseRegistry(pool, excludeClaimId = null) {
     sql += ' WHERE claim_id <> $1';
     params.push(excludeClaimId);
   }
-  sql += ' ORDER BY submitted_at DESC';
+  sql += ' ORDER BY submitted_at DESC LIMIT 1500';
   const { rows } = await pool.query(sql, params);
   return rows;
 }

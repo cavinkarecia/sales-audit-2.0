@@ -213,15 +213,11 @@ async function loadWorkspaceLite(sessionId) {
     'SELECT filename, plan_rows, meta FROM pjp_snapshots WHERE session_id = $1',
     [sessionId]
   );
-  const claimsRes = await pool.query(
-    'SELECT payload FROM claims WHERE session_id = $1 ORDER BY created_at DESC',
-    [sessionId]
-  );
-
   const rawRows = att.rows[0]?.rows || [];
   const planRows = pjp.rows[0]?.plan_rows || [];
   const meta = pjp.rows[0]?.meta || {};
   const indexes = buildPlanIndexes(planRows);
+  const slimClaims = await loadSlimClaimRows(sessionId, 500);
 
   return {
     attendanceFileName: att.rows[0]?.filename || null,
@@ -234,7 +230,7 @@ async function loadWorkspaceLite(sessionId) {
     pjpEmpCodes: meta.pjpEmpCodes || [],
     planByEmpDate: indexes.planByEmpDate,
     planByNameDate: indexes.planByNameDate,
-    claims: claimsRes.rows.map((r) => slimClaimPayload(r.payload)),
+    claims: slimClaims.map((p) => slimClaimPayload(p)),
   };
 }
 
@@ -330,7 +326,13 @@ function buildStateSummaryPayload(summary, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.12-main' });
+  res.json({
+    ok: true,
+    service: 'sentinel-backend',
+    build: '2026.06.13-main',
+    renderBranch: process.env.RENDER_GIT_BRANCH || null,
+    renderService: process.env.RENDER_SERVICE_NAME || null,
+  });
 });
 
 app.get('/api/config', (_req, res) => {
@@ -574,12 +576,57 @@ app.post('/api/upload/pjp', authRequired, upload.single('file'), async (req, res
 
 // --- Claims ---
 
-async function loadSessionClaims(sessionId) {
+const MAX_BILL_DATA_URL_LEN = 6_000_000;
+
+/** Claims list / rules — never load bill images from PostgreSQL into memory. */
+async function loadSlimClaimRows(sessionId, limit = 300) {
   const { rows } = await getPool().query(
-    'SELECT payload FROM claims WHERE session_id = $1 ORDER BY created_at DESC',
-    [sessionId]
+    `SELECT (payload - 'billDataUrl') AS payload
+     FROM claims WHERE session_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [sessionId, limit]
   );
-  return rows.map((r) => slimClaimForClient(r.payload));
+  return rows.map((r) => r.payload);
+}
+
+async function loadSessionClaims(sessionId) {
+  return loadSlimClaimRows(sessionId, 300).map(slimClaimForClient);
+}
+
+/** Minimal workspace for saving/verifying a claim (no attendance blob, no bill images in memory). */
+async function loadWorkspaceForClaimSave(sessionId) {
+  await ensureSession(sessionId);
+  const pool = getPool();
+
+  const [pjp, claimPayloads] = await Promise.all([
+    pool.query(
+      `SELECT filename, plan_rows, meta,
+        CASE WHEN plan_rows IS NULL THEN 0 ELSE jsonb_array_length(plan_rows) END AS plan_n
+       FROM pjp_snapshots WHERE session_id = $1`,
+      [sessionId]
+    ),
+    loadSlimClaimRows(sessionId, 500),
+  ]);
+
+  const meta = pjp.rows[0]?.meta || {};
+  const planN = Number(pjp.rows[0]?.plan_n) || 0;
+  const planRows = planN > 0 && planN <= 12000 ? pjp.rows[0].plan_rows || [] : [];
+  const indexes = buildPlanIndexes(planRows);
+
+  return {
+    attendanceFileName: null,
+    pjpFileName: pjp.rows[0]?.filename || null,
+    rawRows: [],
+    planRows,
+    pjpMonth: meta.pjpMonth || null,
+    pjpMinDate: meta.pjpMinDate || null,
+    pjpMaxDate: meta.pjpMaxDate || null,
+    pjpEmpCodes: meta.pjpEmpCodes || [],
+    planByEmpDate: indexes.planByEmpDate,
+    planByNameDate: indexes.planByNameDate,
+    claims: claimPayloads.map((p) => slimClaimPayload(p)),
+  };
 }
 
 app.get('/api/claims', authRequired, async (req, res) => {
@@ -654,7 +701,13 @@ app.post('/api/claims', authRequired, async (req, res) => {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
 
-    const workspace = await loadWorkspaceLite(sessionId);
+    if (req.body?.billDataUrl && String(req.body.billDataUrl).length > MAX_BILL_DATA_URL_LEN) {
+      return res.status(400).json({
+        error: 'Bill image is too large. Compress the photo or use a smaller screenshot (max ~4 MB).',
+      });
+    }
+
+    const workspace = await loadWorkspaceForClaimSave(sessionId);
     const claim = {
       ...req.body,
       id: req.body.id || `CL-${Date.now().toString(36).toUpperCase()}`,
@@ -693,7 +746,7 @@ app.post('/api/claims/:id/verify', authRequired, async (req, res) => {
     const sessionId = getSessionId(req);
     if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
 
-    const workspace = await loadWorkspaceLite(sessionId);
+    const workspace = await loadWorkspaceForClaimSave(sessionId);
     const row = await getPool().query(
       'SELECT payload FROM claims WHERE id = $1 AND session_id = $2',
       [req.params.id, sessionId]

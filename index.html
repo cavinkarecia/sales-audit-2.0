@@ -1560,7 +1560,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.12';
+const SENTINEL_BUILD = '2026.06.13';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -4015,11 +4015,17 @@ async function reloadClaimsFromBackend() {
   const raw = await resp.text();
   let data = {};
   try { data = raw ? JSON.parse(raw) : {}; } catch { /* ignore */ }
-  if (!resp.ok) throw new Error(data.error || `Could not reload claims (HTTP ${resp.status})`);
+  if (!resp.ok) {
+    throw new Error(
+      data.error ||
+        `Could not reload claims (HTTP ${resp.status}). If this persists, check Render deploy branch is "main" and /health shows build ${SENTINEL_BUILD}-main.`
+    );
+  }
   STATE.claims = (data.claims || []).map(c => ({
     ...c,
     submittedAt: c.submittedAt ? new Date(c.submittedAt) : new Date(),
   }));
+  STATE._claimsLoaded = true;
 }
 
 async function pollBulkPdfJob(jobId) {
