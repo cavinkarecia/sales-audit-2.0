@@ -1618,7 +1618,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.22';
+const SENTINEL_BUILD = '2026.06.23';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -2346,6 +2346,10 @@ const CITY_GEO = {
   'mau': [25.9418, 83.5610],
   'ballia': [25.7522, 84.1500],
   'jaunpur': [25.7479, 82.6837],
+  'hospet': [15.2697, 76.3904],
+  'hosapete': [15.2697, 76.3904],
+  'dhumgara': [26.1333, 91.8000],
+  'dharmanagar': [24.3667, 92.1667],
   'mirzapur': [25.1438, 82.5697],
   'sonbhadra': [24.6814, 83.0686],
   'chandauli': [25.2602, 83.2675],
@@ -3131,26 +3135,7 @@ function buildUnifiedAuditorTableRows() {
 
     const plannedTown = plan?.toTown || '—';
     const workType = plan?.workType || '—';
-    const plannedCoords = plan?.toTown ? resolveCityCoords(plan.toTown) : null;
-    const actualCoords = att?.location || null;
-    let distToPlan = null;
-    let followed = '—';
-    if (!STATE.planRows.length) {
-      followed = '—';
-    } else if (!plan || !plan.workType) {
-      followed = 'No plan';
-    } else if (!att) {
-      followed = 'No submission';
-    } else if (actualCoords && plannedCoords) {
-      distToPlan = haversineKm(plannedCoords.lat, plannedCoords.lng, actualCoords.lat, actualCoords.lng);
-      followed = distToPlan <= PLANNED_SITE_MATCH_KM ? 'Yes' : 'No';
-    } else if (att && !actualCoords) {
-      followed = att.onField ? 'On field (no GPS)' : 'Absent (no GPS)';
-    } else if (plan.toTown && !plannedCoords) {
-      followed = 'Unknown town';
-    } else if (!isMarketVisitWorkType(plan.workType) && !/travel\s*day/i.test(plan.workType || '')) {
-      followed = 'Off-day / leave';
-    }
+    const { followed, distToPlan } = evaluatePjpFollowed(att, plan);
 
     let status = 'No submission';
     if (att) status = att.onField ? 'On Field' : 'Absent';
@@ -3244,10 +3229,9 @@ function renderFieldForceTable() {
       }
       const distPlan =
         r.distToPlan != null
-          ? `<span class="proximity ${r.distToPlan > 100 ? 'far' : r.distToPlan > 35 ? 'medium' : 'near'}">${r.distToPlan.toFixed(1)}</span>`
+          ? `<span class="proximity ${r.distToPlan >= PJP_FOLLOWED_MAX_KM ? (r.distToPlan > 100 ? 'far' : 'medium') : 'near'}">${r.distToPlan.toFixed(1)}</span>`
           : '—';
-      const followCls =
-        r.followed === 'Yes' ? 'pill-on' : String(r.followed).startsWith('No') ? 'pill-absent' : 'pill-off';
+      const followCls = r.followed === 'Yes' ? 'pill-on' : r.followed === 'No' ? 'pill-absent' : 'pill-off';
       const statusPill =
         r.status === 'On Field'
           ? '<span class="pill pill-on">On Field</span>'
@@ -3309,8 +3293,33 @@ function resolvePlanVisitCoords(plan) {
   return resolveMarketVisitToTownCoords(plan);
 }
 
-const PLANNED_SITE_MATCH_KM = 35;
+/** Max km between attendance GPS and PJP Col H (To Town) to count as "Followed PJP? = Yes". */
+const PJP_FOLLOWED_MAX_KM = 50;
+const PLANNED_SITE_MATCH_KM = PJP_FOLLOWED_MAX_KM;
 const UPCOMING_PJP_DAYS = 30;
+
+/** Followed PJP = Yes only if current GPS is within 50 km of planned To Town (Col H). */
+function evaluatePjpFollowed(att, plan) {
+  if (!STATE.planRows.length || !plan?.toTown) {
+    return { followed: STATE.planRows.length ? 'No' : '—', distToPlan: null };
+  }
+  const plannedCoords = resolveCityCoords(plan.toTown);
+  const attRow = att ? hydrateAttendanceRow(att) : null;
+  const actualCoords = attRow?.location || null;
+  if (!attRow || !actualCoords || !plannedCoords) {
+    return { followed: 'No', distToPlan: null };
+  }
+  const distToPlan = haversineKm(
+    plannedCoords.lat,
+    plannedCoords.lng,
+    actualCoords.lat,
+    actualCoords.lng
+  );
+  return {
+    followed: distToPlan < PJP_FOLLOWED_MAX_KM ? 'Yes' : 'No',
+    distToPlan,
+  };
+}
 
 function buildAbsentRowsForDate() {
   const rows = STATE.dateFiltered || [];
