@@ -359,6 +359,7 @@ html, body {
 .map-wrap { height: 480px; position: relative; }
 #map { height: 100%; width: 100%; background: var(--bg-2); }
 .legend-dot.dot-plan { background: #a855f7; }
+.legend-dot.dot-expected { background: #38bdf8; }
 .map-legend {
   position: absolute;
   bottom: 12px; left: 12px;
@@ -928,7 +929,7 @@ html, body {
           <div class="panel-head">
             <div>
               <div class="panel-title">Geographic Footprint</div>
-              <div class="panel-sub" id="map-sub">Live auditor positions</div>
+              <div class="panel-sub" id="map-sub">Attendance GPS + PJP Market Visits (30 days)</div>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <select class="select" id="map-filter">
@@ -937,7 +938,7 @@ html, body {
                 <option value="absent">Absent only</option>
               </select>
               <select class="select" id="map-pjp-auditor" style="min-width:220px" disabled>
-                <option value="">PJP plan — select auditor</option>
+                <option value="">All auditors</option>
               </select>
             </div>
           </div>
@@ -945,11 +946,11 @@ html, body {
             <div class="map-wrap">
               <div id="map"></div>
               <div class="map-legend">
-                <div class="legend-item"><span class="legend-dot dot-on"></span> On Field (current)</div>
-                <div class="legend-item"><span class="legend-dot dot-absent"></span> Absent (current)</div>
-                <div class="legend-item"><span class="legend-dot dot-base"></span> Home Base</div>
-                <div class="legend-item"><span class="legend-dot dot-plan"></span> Market Visit (PJP)</div>
-                <div class="legend-item"><span class="legend-line"></span> Base → Current</div>
+                <div class="legend-item"><span class="legend-dot dot-on"></span> On field (GPS today)</div>
+                <div class="legend-item"><span class="legend-dot dot-absent"></span> Absent (GPS today)</div>
+                <div class="legend-item"><span class="legend-dot dot-expected"></span> Today&apos;s planned site (PJP Col H)</div>
+                <div class="legend-item"><span class="legend-dot dot-plan"></span> Market Visit — next 30 days (Col H)</div>
+                <div class="legend-item"><span class="legend-line"></span> GPS → today&apos;s planned site</div>
               </div>
             </div>
           </div>
@@ -1565,7 +1566,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.17';
+const SENTINEL_BUILD = '2026.06.18';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -2094,6 +2095,11 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 function parseLocation(loc) {
+  if (loc && typeof loc === 'object' && loc.lat != null && loc.lng != null) {
+    const lat = Number(loc.lat);
+    const lng = Number(loc.lng);
+    if (!isNaN(lat) && !isNaN(lng)) return { lat, lng };
+  }
   if (!loc || typeof loc !== 'string') return null;
   const parts = loc.split(',').map(p => parseFloat(p.trim()));
   if (parts.length < 2 || isNaN(parts[0]) || isNaN(parts[1])) return null;
@@ -2970,9 +2976,7 @@ function computeKPIs() {
     scopeNote = ` · attendance scoped to ${STATE.pjpMonth.label} (${STATE.rawRows.length}/${STATE.attendanceRowCountTotal} rows)`;
   }
   $('page-meta').textContent = `${dateStr} · ${universe} · ${STATE.pjpMonth ? STATE.pjpMonth.label + ' PJP month' : 'all dates'}${scopeNote}`;
-  if (!STATE.mapPjpSelectedAuditor) {
-    $('map-sub').textContent = `${present.length} auditors on field · ${absent.length} absent${notSubmitted > 0 ? ` · ${notSubmitted} no submission` : ''}`;
-  }
+  updateMapSubtitle();
   $('ff-sub').textContent = `${rows.length} of ${total} ${pjpSize ? 'PJP' : ''} auditors reported for ${dateStr}`;
 }
 
@@ -3092,15 +3096,187 @@ function isMarketVisitWorkType(workType) {
   return workType && /market\s*visit/i.test(String(workType).trim());
 }
 
-/** Market Visit marker = planned destination (To Town), else From Town. */
+/** Market Visit map point = PJP column H (To Town Name) only. */
+function resolveMarketVisitToTownCoords(plan) {
+  if (!plan?.toTown) return null;
+  const c = resolveCityCoords(plan.toTown);
+  return c ? { ...c, town: plan.toTown } : null;
+}
+
 function resolvePlanVisitCoords(plan) {
-  if (!plan) return null;
-  const towns = [plan.toTown, plan.fromTown].filter(Boolean);
-  for (const town of towns) {
-    const c = resolveCityCoords(town);
-    if (c) return { ...c, town };
+  return resolveMarketVisitToTownCoords(plan);
+}
+
+const PLANNED_SITE_MATCH_KM = 35;
+const UPCOMING_PJP_DAYS = 30;
+
+function buildAbsentRowsForDate() {
+  const rows = STATE.dateFiltered || [];
+  const absent = rows.filter((r) => !r.onField);
+  if (!STATE.pjpEmpCodes?.size) return absent;
+  const submittedCodes = new Set();
+  rows.forEach((r) => {
+    const m = findAuditor(r.auditor, r.auditorId);
+    if (m?.empCode) submittedCodes.add(normalizeEmpCode(m.empCode));
+  });
+  const noSub = [];
+  for (const code of STATE.pjpEmpCodes) {
+    const nc = normalizeEmpCode(code);
+    if (submittedCodes.has(nc)) continue;
+    const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === nc);
+    noSub.push({
+      auditor: m?.name || code,
+      auditorId: code,
+      onField: false,
+      absentReason: 'Did not submit attendance',
+      location: null,
+      raw: {},
+      noSubmission: true,
+    });
   }
+  noSub.sort((a, b) => String(a.auditor).localeCompare(String(b.auditor)));
+  return [...absent, ...noSub];
+}
+
+function getAuditorsUniverse() {
+  if (STATE.pjpEmpCodes?.size) {
+    return [...STATE.pjpEmpCodes]
+      .map((code) => {
+        const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(code));
+        return m || { empCode: code, name: code, cluster: '', hometown: '', lat: null, lng: null };
+      })
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  }
+  const seen = new Map();
+  (STATE.dateFiltered || []).forEach((r) => {
+    const m = findAuditor(r.auditor, r.auditorId);
+    const code = normalizeEmpCode(m?.empCode || r.auditor || '');
+    if (!code || seen.has(code)) return;
+    seen.set(code, m || { empCode: code, name: r.auditor, cluster: '—', hometown: '', lat: null, lng: null });
+  });
+  return [...seen.values()].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+}
+
+function getTodayPlanForAuditor(empCode, master) {
+  if (!STATE.filteredDate) return null;
+  const dKey = dateKey(new Date(STATE.filteredDate));
+  const ec = normalizeEmpCode(empCode);
+  return (
+    STATE.planByEmpDate[`${ec}|${dKey}`] ||
+    (master && STATE.planByNameDate[`${normalizeName(master.name)}|${dKey}`]) ||
+    null
+  );
+}
+
+function getExpectedCoordsForPlan(plan) {
+  if (!plan) return null;
+  if (isMarketVisitWorkType(plan.workType) && plan.toTown) return resolveCityCoords(plan.toTown);
+  if (/travel\s*day/i.test(plan.workType || '') && plan.toTown) return resolveCityCoords(plan.toTown);
   return null;
+}
+
+function isTravelingAuditor(attRow, plan) {
+  if (attRow && /travel/i.test(attRow.absentReason || '')) return true;
+  if (plan && /travel\s*day/i.test(plan.workType || '')) return true;
+  if (
+    plan &&
+    isMarketVisitWorkType(plan.workType) &&
+    plan.fromTown &&
+    plan.toTown &&
+    normalizeName(plan.fromTown) !== normalizeName(plan.toTown)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Market Visit rows in the next N days from the selected date (Col H = toTown). */
+function buildUpcomingMarketVisitMarkers(fromDate, days = UPCOMING_PJP_DAYS, empCodeFilter = null) {
+  if (!STATE.planRows.length || !fromDate) return [];
+  const start = fromDate instanceof Date ? fromDate : new Date(fromDate);
+  const startKey = dateKey(start);
+  const end = new Date(start);
+  end.setDate(end.getDate() + days);
+  const endKey = dateKey(end);
+  const todayKey = STATE.filteredDate ? dateKey(new Date(STATE.filteredDate)) : startKey;
+  const visitIdxByAuditor = {};
+  const out = [];
+  for (const plan of STATE.planRows) {
+    if (!isMarketVisitWorkType(plan.workType) || !plan.dateKey || !plan.toTown) continue;
+    if (plan.dateKey < startKey || plan.dateKey > endKey) continue;
+    const ec = normalizeEmpCode(plan.empCode);
+    if (empCodeFilter && normalizeEmpCode(empCodeFilter) !== ec) continue;
+    const geo = resolveMarketVisitToTownCoords(plan);
+    if (!geo) continue;
+    const idx = visitIdxByAuditor[ec] || 0;
+    visitIdxByAuditor[ec] = idx + 1;
+    const coords = offsetCoordsForVisitIndex(geo.lat, geo.lng, idx);
+    const master = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === ec);
+    const d = plan.date ? new Date(plan.date) : new Date(`${plan.dateKey}T12:00:00`);
+    out.push({
+      plan,
+      coords,
+      town: plan.toTown,
+      empCode: ec,
+      auditorName: master?.name || plan.empName || ec,
+      dateKey: plan.dateKey,
+      dateLabel: d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+      isToday: plan.dateKey === todayKey,
+    });
+  }
+  return out.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+}
+
+function buildMapAuditorEntries() {
+  const focusCode = $('map-pjp-auditor')?.value || '';
+  const filter = $('map-filter')?.value || 'all';
+  const attByCode = {};
+  (STATE.dateFiltered || []).forEach((r) => {
+    const m = findAuditor(r.auditor, r.auditorId);
+    const code = normalizeEmpCode(m?.empCode || '');
+    if (code) attByCode[code] = r;
+  });
+
+  let auditors = getAuditorsUniverse();
+  if (focusCode) {
+    auditors = auditors.filter((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focusCode));
+  }
+
+  return auditors
+    .map((master) => {
+      const code = normalizeEmpCode(master.empCode);
+      const att = attByCode[code] || null;
+      const noSubmission = !att && STATE.pjpEmpCodes.size > 0;
+      const onField = att ? att.onField : noSubmission ? false : null;
+      const todayPlan = getTodayPlanForAuditor(code, master);
+      const expectedGeo = getExpectedCoordsForPlan(todayPlan);
+      let distFromPlanned = null;
+      let atExpected = null;
+      if (att?.location && expectedGeo) {
+        distFromPlanned = haversineKm(expectedGeo.lat, expectedGeo.lng, att.location.lat, att.location.lng);
+        atExpected = distFromPlanned <= PLANNED_SITE_MATCH_KM;
+      }
+      return {
+        master,
+        code,
+        att,
+        onField,
+        noSubmission,
+        todayPlan,
+        expectedGeo,
+        distFromPlanned,
+        atExpected,
+        traveling: isTravelingAuditor(att, todayPlan),
+        location: att?.location || null,
+        absentReason: att?.absentReason || (noSubmission ? 'Did not submit attendance' : null),
+        auditorName: master.name || att?.auditor || code,
+      };
+    })
+    .filter((e) => {
+      if (filter === 'on_field') return e.onField === true;
+      if (filter === 'absent') return e.onField === false || e.noSubmission;
+      return true;
+    });
 }
 
 /** Slight offset so stacked same-city visits remain visible as separate points. */
@@ -3160,67 +3336,29 @@ function buildAuditorMarketVisits(empCode) {
   return rows.map((plan, i) => planRowToMapDay(plan, i));
 }
 
-/** Full PJP month calendar (all work types) for the table. */
-function buildAuditorPlanMonthDays(empCode) {
-  if (!STATE.pjpMinDate || !STATE.pjpMaxDate) {
-    return buildAuditorPlanRowsInPjpMonth(empCode).map((plan, i) => planRowToMapDay(plan, i));
-  }
-  const days = [];
-  const cursor = new Date(STATE.pjpMinDate);
-  const end = new Date(STATE.pjpMaxDate);
-  let visitIdx = 0;
-  while (cursor <= end) {
-    const dKey = dateKey(cursor);
-    const plan = STATE.planByEmpDate[`${normalizeEmpCode(empCode)}|${dKey}`] || null;
-    const row = plan ? planRowToMapDay(plan, isMarketVisitWorkType(plan.workType) ? visitIdx++ : 0) : {
-      dateKey: dKey,
-      dateLabel: cursor.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
-      day: cursor.toLocaleDateString('en-IN', { weekday: 'short' }),
-      plan: null,
-      fromTown: null,
-      plannedTown: null,
-      workType: null,
-      kms: null,
-      hotelStay: null,
-      plannedCoords: null,
-      isMarketVisit: false,
-      visitIndex: 0,
-    };
-    days.push(row);
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  return days;
-}
-
 function populateMapPjpAuditorSelect() {
   const select = $('map-pjp-auditor');
   if (!select) return;
   const prev = STATE.mapPjpSelectedAuditor || select.value;
-  if (!STATE.planRows.length) {
+  if (!STATE.planRows.length && !STATE.pjpEmpCodes.size) {
     select.disabled = true;
-    select.innerHTML = '<option value="">Upload PJP to see 30-day plan</option>';
+    select.innerHTML = '<option value="">Upload PJP for planned visits</option>';
     STATE.mapPjpSelectedAuditor = '';
     return;
   }
-  const codes = STATE.pjpEmpCodes.size
-    ? [...STATE.pjpEmpCodes]
-    : [...new Set(STATE.planRows.map((p) => p.empCode).filter(Boolean))];
-  const auditors = codes
-    .map((code) => {
-      const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(code));
-      return m || { empCode: code, name: code, cluster: '' };
-    })
-    .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+  const auditors = getAuditorsUniverse();
   select.disabled = false;
   select.innerHTML =
-    '<option value="">— Select auditor (30-day PJP) —</option>' +
+    '<option value="">All auditors</option>' +
     auditors
       .map(
         (a) =>
           `<option value="${escapeHtml(a.empCode)}">${escapeHtml(a.name)} · ${escapeHtml(a.cluster || a.empCode)}</option>`
       )
       .join('');
-  if (prev && auditors.some((a) => a.empCode === prev)) select.value = prev;
+  if (prev && (prev === '' || auditors.some((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(prev)))) {
+    select.value = prev;
+  }
   STATE.mapPjpSelectedAuditor = select.value;
 }
 
@@ -3232,94 +3370,34 @@ function clearMapPjpOverlay() {
   STATE.mapPjpLines = [];
 }
 
-function renderMapPjpOnMap(master, marketVisits) {
-  clearMapPjpOverlay();
-  if (!master || !marketVisits.length) return;
-  initMap();
-  const allBounds = [];
-  if (master.lat != null && master.lng != null) {
-    const baseMarker = L.circleMarker([master.lat, master.lng], {
-      radius: 8,
-      fillColor: 'transparent',
-      color: '#fbbf24',
-      weight: 2.5,
-      opacity: 1,
-      fillOpacity: 0,
-    }).addTo(STATE.map);
-    baseMarker.bindPopup(
-      `<div style="font-family:Inter,sans-serif"><strong>🏠 ${escapeHtml(master.name)}</strong><br>${escapeHtml(master.hometown || '')}</div>`
-    );
-    STATE.mapPjpMarkers.push(baseMarker);
-    allBounds.push([master.lat, master.lng]);
-  }
-  marketVisits.forEach((d, idx) => {
-    if (!d.plannedCoords) return;
-    const m = L.circleMarker([d.plannedCoords.lat, d.plannedCoords.lng], {
-      radius: 6,
-      fillColor: '#a855f7',
-      color: '#0a0e1a',
-      weight: 1,
-      opacity: 1,
-      fillOpacity: 0.92,
-    }).addTo(STATE.map);
-    const route =
-      d.fromTown && d.plannedTown && d.fromTown !== d.plannedTown
-        ? `${escapeHtml(d.fromTown)} → ${escapeHtml(d.plannedTown)}`
-        : escapeHtml(d.plannedTown || d.fromTown || '—');
-    const geoName = d.plannedCoords.town || d.plannedTown || d.fromTown || '';
-    m.bindPopup(`
-      <div style="font-family:Inter,sans-serif;min-width:200px">
-        <div style="font-weight:600;color:#0a0e1a">Market Visit #${idx + 1} · ${escapeHtml(d.dateLabel)}</div>
-        <div style="font-size:10px;color:#9ca3af">${escapeHtml(d.day)}</div>
-        <div style="font-size:11px;color:#6b7280;margin-top:4px">📍 ${escapeHtml(geoName)}</div>
-        <div style="font-size:11px;color:#6b7280">📋 ${route}</div>
-        ${d.kms != null ? `<div style="font-size:11px;color:#6b7280">${d.kms} km</div>` : ''}
-      </div>
-    `);
-    STATE.mapPjpMarkers.push(m);
-    allBounds.push([d.plannedCoords.lat, d.plannedCoords.lng]);
-  });
-  if (allBounds.length) {
-    STATE.map.fitBounds(allBounds, { padding: [40, 40], maxZoom: 8 });
-  }
-}
-
-function setDefaultMapSub() {
-  if (STATE.mapPjpSelectedAuditor) return;
+function updateMapSubtitle() {
   const rows = STATE.dateFiltered || [];
   const present = rows.filter((r) => r.onField);
-  const absent = rows.filter((r) => !r.onField);
-  const notSubmitted = (STATE.pjpEmpCodes?.size || 0) - rows.length;
-  $('map-sub').textContent = `${present.length} auditors on field · ${absent.length} absent${notSubmitted > 0 ? ` · ${notSubmitted} no submission` : ''}`;
+  const absentSubmitted = rows.filter((r) => !r.onField);
+  const notSubmitted = STATE.pjpEmpCodes.size ? Math.max(0, STATE.pjpEmpCodes.size - rows.length) : 0;
+  const focus = $('map-pjp-auditor')?.value || '';
+  const fromDate = STATE.filteredDate ? new Date(STATE.filteredDate) : null;
+  const upcoming =
+    fromDate && STATE.planRows.length
+      ? buildUpcomingMarketVisitMarkers(fromDate, UPCOMING_PJP_DAYS, focus || null).length
+      : 0;
+  let sub = `${present.length} on field · ${absentSubmitted.length} absent`;
+  if (notSubmitted) sub += ` · ${notSubmitted} no submission`;
+  if (upcoming) sub += ` · ${upcoming} Market Visits (30d on map)`;
+  if (focus) {
+    const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focus));
+    sub = `${m?.name || focus} · ${sub}`;
+  }
+  if ($('map-sub')) $('map-sub').textContent = sub;
 }
 
 function renderMapPjpPanel() {
-  const empCode = STATE.mapPjpSelectedAuditor;
-  if (!empCode || !STATE.planRows.length) {
-    clearMapPjpOverlay();
-    setDefaultMapSub();
-    return;
-  }
-  const master = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(empCode));
-  const marketVisits = buildAuditorMarketVisits(empCode);
-  const marketVisitTotal = marketVisits.length;
-  const onMap = marketVisits.filter((d) => d.plannedCoords).length;
-  const missingGeo = marketVisitTotal - onMap;
-  const rangeLabel = STATE.pjpMonth ? STATE.pjpMonth.label : 'PJP month';
-  const who = master ? master.name : empCode;
-  let sub = `${who} · ${onMap} Market Visit point${onMap === 1 ? '' : 's'} on map (${marketVisitTotal} in ${rangeLabel})`;
-  if (missingGeo > 0) {
-    const missing = marketVisits.filter((d) => !d.plannedCoords).map((d) => d.plannedTown || d.fromTown).filter(Boolean);
-    sub += ` · ${missingGeo} not mapped: ${[...new Set(missing)].slice(0, 3).join(', ')}${missing.length > 3 ? '…' : ''}`;
-  }
-  $('map-sub').textContent = sub;
-  renderMapPjpOnMap(master, marketVisits);
+  updateMapSubtitle();
 }
 
 $('map-pjp-auditor')?.addEventListener('change', () => {
   STATE.mapPjpSelectedAuditor = $('map-pjp-auditor').value;
   renderMap();
-  renderMapPjpPanel();
 });
 
 // =================================================================
@@ -3338,106 +3416,152 @@ function initMap() {
 function renderMap() {
   initMap();
   clearMapPjpOverlay();
-  // Clear previous markers and lines
   if (STATE.markers.length) {
-    STATE.markers.forEach(m => STATE.map.removeLayer(m));
+    STATE.markers.forEach((m) => STATE.map.removeLayer(m));
     STATE.markers = [];
   }
   if (STATE.lines.length) {
-    STATE.lines.forEach(l => STATE.map.removeLayer(l));
+    STATE.lines.forEach((l) => STATE.map.removeLayer(l));
     STATE.lines = [];
   }
 
-  const filter = $('map-filter').value;
-  const ffRows = buildFieldForceRows();
-  const filtered = ffRows.filter(r => {
-    if (filter === 'on_field' && !r.onField) return false;
-    if (filter === 'absent' && r.onField) return false;
-    return true;
-  });
-
+  updateMapSubtitle();
   const allPoints = [];
+  const focusCode = $('map-pjp-auditor')?.value || '';
+  const fromDate = STATE.filteredDate ? new Date(STATE.filteredDate) : null;
 
-  filtered.forEach(r => {
-    // Plot CURRENT location (if available)
-    if (r.location) {
-      const currentColor = r.onField ? '#22c55e' : '#ef4444';
-      const currentMarker = L.circleMarker([r.location.lat, r.location.lng], {
-        radius: 7,
+  if (fromDate && STATE.planRows.length) {
+    const upcoming = buildUpcomingMarketVisitMarkers(fromDate, UPCOMING_PJP_DAYS, focusCode || null);
+    upcoming.forEach((v) => {
+      if (v.isToday) return;
+      const m = L.circleMarker([v.coords.lat, v.coords.lng], {
+        radius: 4,
+        fillColor: '#a855f7',
+        color: '#0a0e1a',
+        weight: 1,
+        opacity: 0.85,
+        fillOpacity: 0.55,
+      }).addTo(STATE.map);
+      m.bindPopup(`
+        <div style="font-family:Inter,sans-serif;min-width:180px">
+          <div style="font-weight:600;color:#0a0e1a">${escapeHtml(v.auditorName)}</div>
+          <div style="font-size:11px;color:#6b7280">Market Visit · ${escapeHtml(v.dateLabel)}</div>
+          <div style="font-size:11px;color:#6b7280">📍 Planned (Col H): <strong>${escapeHtml(v.town)}</strong></div>
+          ${v.plan.fromTown ? `<div style="font-size:11px;color:#9ca3af">From ${escapeHtml(v.plan.fromTown)}</div>` : ''}
+        </div>
+      `);
+      STATE.mapPjpMarkers.push(m);
+      allPoints.push([v.coords.lat, v.coords.lng]);
+    });
+  }
+
+  const entries = buildMapAuditorEntries();
+  entries.forEach((e) => {
+    const plannedTown = e.todayPlan?.toTown || null;
+    const workType = e.todayPlan?.workType || '—';
+
+    if (e.expectedGeo) {
+      const expMarker = L.circleMarker([e.expectedGeo.lat, e.expectedGeo.lng], {
+        radius: 5,
+        fillColor: '#38bdf8',
+        color: '#0a0e1a',
+        weight: 1,
+        opacity: 1,
+        fillOpacity: 0.75,
+      }).addTo(STATE.map);
+      expMarker.bindPopup(`
+        <div style="font-family:Inter,sans-serif;min-width:200px">
+          <div style="font-weight:600;color:#0a0e1a">${escapeHtml(e.auditorName)}</div>
+          <div style="font-size:11px;color:#6b7280">Today&apos;s planned site (PJP Col H)</div>
+          <div style="font-size:11px;color:#374151"><strong>${escapeHtml(plannedTown || e.expectedGeo.name || '—')}</strong> · ${escapeHtml(workType)}</div>
+        </div>
+      `);
+      STATE.markers.push(expMarker);
+      allPoints.push([e.expectedGeo.lat, e.expectedGeo.lng]);
+    }
+
+    if (e.location) {
+      const currentColor = e.onField ? '#22c55e' : '#ef4444';
+      const currentName =
+        nearestCityName(e.location.lat, e.location.lng) ||
+        `${e.location.lat.toFixed(3)}, ${e.location.lng.toFixed(3)}`;
+      const currentMarker = L.circleMarker([e.location.lat, e.location.lng], {
+        radius: 8,
         fillColor: currentColor,
         color: '#0a0e1a',
         weight: 1.5,
         opacity: 1,
         fillOpacity: 0.95,
       }).addTo(STATE.map);
-      const distText = r.proximity != null ? `${r.proximity.toFixed(1)} km from base` : 'distance unknown';
-      const popup = `
-        <div style="font-family:Inter,sans-serif;min-width:220px">
-          <div style="font-weight:600;color:#0a0e1a;margin-bottom:2px">${escapeHtml(r.auditor || 'Unknown')}</div>
-          <div style="font-size:10px;color:#9ca3af;font-family:monospace;margin-bottom:6px">${escapeHtml(r.empCode)} · ${escapeHtml(r.cluster)}</div>
-          <div style="font-size:11px;color:#374151;margin-bottom:2px">📍 <strong>Current:</strong> ${escapeHtml(r.currentName)}</div>
-          <div style="font-size:11px;color:#374151;margin-bottom:2px">🏠 <strong>Base:</strong> ${escapeHtml(r.baseName)}</div>
-          <div style="font-size:11px;color:${r.proximity > 100 ? '#ef4444' : r.proximity > 25 ? '#f59e0b' : '#22c55e'};margin-bottom:6px"><strong>${distText}</strong></div>
-          <div style="font-size:11px;color:#6b7280">Status: <strong style="color:${currentColor}">${r.onField ? 'On Field' : 'Absent'}</strong></div>
-          ${r.asm ? `<div style="font-size:11px;color:#6b7280">ASM: ${escapeHtml(r.asm)}</div>` : ''}
-          ${r.distributorName ? `<div style="font-size:11px;color:#6b7280">Distributor: ${escapeHtml(r.distributorName)}</div>` : ''}
-          ${r.totalShops ? `<div style="font-size:11px;color:#6b7280">Shops in beat: ${r.totalShops}</div>` : ''}
-          ${r.absentReason ? `<div style="font-size:11px;color:#ef4444;margin-top:4px">Reason: ${escapeHtml(r.absentReason)}</div>` : ''}
-        </div>
-      `;
-      currentMarker.bindPopup(popup);
-      STATE.markers.push(currentMarker);
-      allPoints.push([r.location.lat, r.location.lng]);
-    }
 
-    // Plot BASE location (hollow amber circle)
-    if (r.baseCoords) {
-      const baseMarker = L.circleMarker([r.baseCoords.lat, r.baseCoords.lng], {
-        radius: 6,
-        fillColor: 'transparent',
-        color: '#fbbf24',
-        weight: 2,
-        opacity: 0.9,
-        fillOpacity: 0,
-      }).addTo(STATE.map);
-      baseMarker.bindPopup(`
-        <div style="font-family:Inter,sans-serif;min-width:180px">
-          <div style="font-weight:600;color:#0a0e1a;margin-bottom:2px">🏠 ${escapeHtml(r.auditor)}'s Home Base</div>
-          <div style="font-size:11px;color:#6b7280">${escapeHtml(r.baseName)}</div>
+      let planLine = '';
+      if (e.expectedGeo && e.distFromPlanned != null) {
+        const matchColor = e.atExpected ? '#22c55e' : e.distFromPlanned > 100 ? '#ef4444' : '#f59e0b';
+        planLine = `<div style="font-size:11px;color:${matchColor};margin-top:4px"><strong>${e.atExpected ? 'At planned site' : `${e.distFromPlanned.toFixed(1)} km from planned site`}</strong> (${escapeHtml(plannedTown || '—')})</div>`;
+        const line = L.polyline(
+          [
+            [e.location.lat, e.location.lng],
+            [e.expectedGeo.lat, e.expectedGeo.lng],
+          ],
+          { color: matchColor, weight: 1.5, opacity: 0.55, dashArray: '6, 4' }
+        ).addTo(STATE.map);
+        STATE.lines.push(line);
+      } else if (plannedTown && !e.expectedGeo) {
+        planLine = `<div style="font-size:11px;color:#f59e0b;margin-top:4px">Planned ${escapeHtml(plannedTown)} — town not in city map</div>`;
+      }
+
+      const travelLine = e.traveling
+        ? `<div style="font-size:11px;color:#a78bfa;margin-top:2px"><strong>Travelling</strong>${e.todayPlan?.fromTown && plannedTown ? ` · ${escapeHtml(e.todayPlan.fromTown)} → ${escapeHtml(plannedTown)}` : ''}</div>`
+        : '';
+
+      currentMarker.bindPopup(`
+        <div style="font-family:Inter,sans-serif;min-width:220px">
+          <div style="font-weight:600;color:#0a0e1a;margin-bottom:2px">${escapeHtml(e.auditorName)}</div>
+          <div style="font-size:10px;color:#9ca3af;font-family:monospace;margin-bottom:6px">${escapeHtml(e.code)} · ${escapeHtml(e.master.cluster || '—')}</div>
+          <div style="font-size:11px;color:#374151">📍 <strong>GPS (attendance):</strong> ${escapeHtml(currentName)}</div>
+          <div style="font-size:11px;color:#6b7280">Status: <strong style="color:${currentColor}">${e.onField ? 'On field' : 'Absent'}</strong></div>
+          ${planLine}
+          ${travelLine}
+          ${e.absentReason ? `<div style="font-size:11px;color:#ef4444;margin-top:4px">${escapeHtml(e.absentReason)}</div>` : ''}
         </div>
       `);
-      STATE.markers.push(baseMarker);
-      allPoints.push([r.baseCoords.lat, r.baseCoords.lng]);
-    }
-
-    // Draw connecting line if BOTH base and current are known
-    if (r.baseCoords && r.location) {
-      const lineColor = r.proximity > 100 ? '#ef4444' : r.proximity > 25 ? '#f59e0b' : '#22c55e';
-      const line = L.polyline([
-        [r.baseCoords.lat, r.baseCoords.lng],
-        [r.location.lat, r.location.lng],
-      ], {
-        color: lineColor,
-        weight: 1.2,
-        opacity: 0.45,
-        dashArray: '4, 4',
-      }).addTo(STATE.map);
-      STATE.lines.push(line);
+      STATE.markers.push(currentMarker);
+      allPoints.push([e.location.lat, e.location.lng]);
+    } else if (e.noSubmission || e.onField === false) {
+      const ghost = L.circleMarker(
+        e.expectedGeo ? [e.expectedGeo.lat, e.expectedGeo.lng] : [22, 79],
+        {
+          radius: 6,
+          fillColor: '#ef4444',
+          color: '#0a0e1a',
+          weight: 1,
+          opacity: e.expectedGeo ? 0.35 : 0,
+          fillOpacity: e.expectedGeo ? 0.25 : 0,
+        }
+      );
+      if (e.expectedGeo) {
+        ghost.addTo(STATE.map);
+        ghost.bindPopup(`
+          <div style="font-family:Inter,sans-serif">
+            <div style="font-weight:600;color:#0a0e1a">${escapeHtml(e.auditorName)}</div>
+            <div style="font-size:11px;color:#ef4444">${escapeHtml(e.absentReason || 'Absent')}</div>
+            <div style="font-size:11px;color:#6b7280">No GPS in attendance for this date</div>
+            ${plannedTown ? `<div style="font-size:11px;color:#6b7280">Planned today: ${escapeHtml(plannedTown)}</div>` : ''}
+          </div>
+        `);
+        STATE.markers.push(ghost);
+      }
     }
   });
 
-  if (STATE.mapPjpSelectedAuditor && STATE.planRows.length) {
-    const master = AUDITOR_MASTER.find(
-      (a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(STATE.mapPjpSelectedAuditor)
-    );
-    renderMapPjpOnMap(master, buildAuditorMarketVisits(STATE.mapPjpSelectedAuditor));
-  } else if (allPoints.length) {
-    const group = L.featureGroup(STATE.markers);
-    STATE.map.fitBounds(group.getBounds().pad(0.15), { maxZoom: 7 });
+  if (allPoints.length) {
+    STATE.map.fitBounds(L.latLngBounds(allPoints), { padding: [48, 48], maxZoom: focusCode ? 9 : 6 });
   }
 }
 
-$('map-filter').addEventListener('change', renderMap);
+$('map-filter').addEventListener('change', () => {
+  renderMap();
+});
 
 // =================================================================
 // EXPENSE MANAGEMENT VIEW
@@ -5383,7 +5507,7 @@ function openDrill(type) {
     title.textContent = 'Attendance';
     sub.textContent = `${dateStr} · Present vs Absent`;
     const present = rows.filter(r => r.onField);
-    const absent = rows.filter(r => !r.onField);
+    const absent = buildAbsentRowsForDate();
     body.innerHTML = `
       <div class="tabs">
         <button class="tab active" data-tab="present">Present <span class="tab-count">${present.length}</span></button>
@@ -5468,8 +5592,12 @@ function openDrill(type) {
     setupDrillSearch();
   } else if (type === 'absentees') {
     title.textContent = 'Absentees';
-    sub.textContent = `${dateStr} · By reason`;
-    const absent = rows.filter(r => !r.onField);
+    sub.textContent = `${dateStr} · By reason (includes no submission)`;
+    const absent = buildAbsentRowsForDate();
+    if ($('map-filter')) {
+      $('map-filter').value = 'absent';
+      renderMap();
+    }
     // Group by reason
     const byReason = {};
     absent.forEach(r => {
@@ -5533,10 +5661,12 @@ function renderDrillRows(rows, type) {
           ${rows.map(r => {
             const master = findAuditor(r.auditor, r.auditorId);
             const cluster = master ? master.cluster : '';
-            const note = r.raw['Reason for Diversion in Plan']
+            const note = r.noSubmission
+              ? 'No attendance form submitted for this date'
+              : (r.raw['Reason for Diversion in Plan']
               || r.raw['Explain the SDE/DSE/Distributor/Auditor Reason']
               || r.raw['Reason for SDE/DSE/Distributor/Auditor issue']
-              || '—';
+              || '—');
             const clusterPill = cluster
               ? `<span class="cluster-pill cluster-${cluster.toLowerCase()}">${escapeHtml(cluster)}</span>`
               : `<span class="text-faint">—</span>`;
