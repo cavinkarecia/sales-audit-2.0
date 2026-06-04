@@ -330,7 +330,7 @@ function buildStateSummaryPayload(summary, filteredDate) {
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.11-main2' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.11-main' });
 });
 
 app.get('/api/config', (_req, res) => {

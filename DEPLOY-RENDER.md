@@ -21,13 +21,27 @@ If the project is not on GitHub yet:
 
 ---
 
+## Production target (use this)
+
+| | |
+|--|--|
+| GitHub | `cavinkarecia/sales-audit-2.0` — branch **`main`** |
+| Render | Web service **`sales-audit-2.0-2`** |
+| URL | https://sales-audit-2-0-2.onrender.com |
+
+See [DEPLOY-TARGET.md](./DEPLOY-TARGET.md) for push commands and what **not** to mix with.
+
 ## Step 2 — Create the app on Render
+
+If the service already exists: **Settings** → set **Branch** to **`main`**, **Root directory** to **`backend`**, then save.
+
+For a new Blueprint deploy:
 
 1. Log in to [dashboard.render.com](https://dashboard.render.com).
 2. Click **New +** → **Blueprint**.
-3. Connect your GitHub account and select the repository that contains this project.
+3. Connect GitHub and select **`cavinkarecia/sales-audit-2.0`** (branch **`main`**).
 4. Render will read `render.yaml` and propose:
-   - **sentinel** (web service)
+   - **sentinel** (web service) — rename or map to **`sales-audit-2.0-2`** in your dashboard if needed
    - **sentinel-db** (PostgreSQL database)
 5. Click **Apply**.
 
