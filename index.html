@@ -1560,7 +1560,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.7';
+const SENTINEL_BUILD = '2026.06.8';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1568,16 +1568,38 @@ let BACKEND_AUTH_REQUIRED = false;
 
 function loadStoredApiKey() {
   try {
-    const k = sessionStorage.getItem(API_KEY_STORAGE);
+    let k = localStorage.getItem(API_KEY_STORAGE);
+    if (!k) {
+      k = sessionStorage.getItem(API_KEY_STORAGE);
+      if (k && k.startsWith('sk-ant-')) {
+        localStorage.setItem(API_KEY_STORAGE, k);
+        sessionStorage.removeItem(API_KEY_STORAGE);
+      }
+    }
     if (k && k.startsWith('sk-ant-')) STATE.claudeApiKey = k;
   } catch (e) { /* private browsing */ }
 }
 
 function saveStoredApiKey(key) {
   try {
-    if (key) sessionStorage.setItem(API_KEY_STORAGE, key);
-    else sessionStorage.removeItem(API_KEY_STORAGE);
+    if (key) {
+      localStorage.setItem(API_KEY_STORAGE, key);
+      sessionStorage.setItem(API_KEY_STORAGE, key);
+    } else {
+      localStorage.removeItem(API_KEY_STORAGE);
+      sessionStorage.removeItem(API_KEY_STORAGE);
+    }
   } catch (e) { /* ignore */ }
+}
+
+async function parseApiResponse(resp) {
+  const raw = await resp.text();
+  if (!raw) return { data: {}, raw: '' };
+  try {
+    return { data: JSON.parse(raw), raw };
+  } catch {
+    return { data: {}, raw };
+  }
 }
 
 async function apiFetch(path, options = {}) {
@@ -1665,7 +1687,11 @@ async function loadStateFromBackend() {
 async function bootstrapBackend() {
   if (!USE_BACKEND) return;
   try {
+    await ensureBackendSession();
+    const cfgResp = await apiFetch('/api/config');
+    const { data: cfg } = await parseApiResponse(cfgResp);
     BACKEND_AUTH_REQUIRED = false;
+    STATE.hasServerApiKey = !!cfg.hasServerApiKey;
     showLoginGate(false);
     updateApiKeyChip();
     await loadStateFromBackend();
@@ -1865,7 +1891,8 @@ const STATE = {
 
   // Expense claims (in-memory only — no persistence)
   claims: [],
-  claudeApiKey: '',  // Pasted by user when running standalone; auto-detected in artifact mode
+  claudeApiKey: '',  // Saved in localStorage or sent from browser header
+  hasServerApiKey: false,  // true when ANTHROPIC_API_KEY is set on Render
 
   // Map state
   map: null,
@@ -2219,9 +2246,10 @@ async function handleFile(file, kind) {
       fd.append('file', file);
       const endpoint = kind === 'attendance' ? '/api/upload/attendance' : '/api/upload/pjp';
       const resp = await apiFetch(endpoint, { method: 'POST', body: fd });
-      const data = await resp.json().catch(() => ({}));
+      const { data, raw } = await parseApiResponse(resp);
       if (!resp.ok) {
-        alert(data.error || 'Upload failed.');
+        const msg = data.error || (raw ? raw.slice(0, 200) : '') || `Upload failed (HTTP ${resp.status}).`;
+        alert(msg);
         return;
       }
       applyStateFromServer(data);
@@ -3519,7 +3547,7 @@ async function runRosterAIReview() {
   const days = buildRosterDays(empCode);
   if (!days.length) { alert('No data to review.'); return; }
 
-  if (!STATE.claudeApiKey && !isInArtifactContext()) {
+  if (!hasAiKeyReady()) {
     alert('Set your Anthropic API key first — click the "AI Key" chip in the header and paste your sk-ant-... key.');
     return;
   }
@@ -3903,7 +3931,7 @@ $('bulk-claim-process').addEventListener('click', async () => {
     alert('Select a PDF first — click the upload box above.');
     return;
   }
-  if (!STATE.claudeApiKey && !isInArtifactContext()) {
+  if (!hasAiKeyReady()) {
     alert('Set Anthropic API key first (AI Key chip).');
     openApiKeyModal();
     return;
@@ -4266,12 +4294,19 @@ function showApiKeyTestResult(msg, kind, force) {
   }
 }
 
+function hasAiKeyReady() {
+  return !!(STATE.claudeApiKey || STATE.hasServerApiKey || isInArtifactContext());
+}
+
 function updateApiKeyChip() {
   const chip = $('chip-apikey');
   const status = $('chip-apikey-status');
   if (STATE.claudeApiKey) {
     chip.classList.add('loaded');
     status.textContent = maskKey(STATE.claudeApiKey).slice(0, 18) + '…';
+  } else if (STATE.hasServerApiKey) {
+    chip.classList.add('loaded');
+    status.textContent = 'Server (Render)';
   } else if (isInArtifactContext()) {
     chip.classList.add('loaded');
     status.textContent = 'Auto';
@@ -4333,7 +4368,7 @@ $('claim-submit').addEventListener('click', async () => {
   if (!USE_BACKEND) applyRuleChecks(claim);
 
   if (USE_BACKEND) {
-    if (pendingBillFile && pendingBillFile.type.startsWith('image/') && !STATE.claudeApiKey && !isInArtifactContext()) {
+    if (pendingBillFile && pendingBillFile.type.startsWith('image/') && !hasAiKeyReady()) {
       alert('Paste your Anthropic API key first (AI Key chip in the header) to verify bill images.');
       return;
     }

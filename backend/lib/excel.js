@@ -9,12 +9,14 @@ const {
 } = require('./utils');
 
 function normalizeRow(r) {
-  const loc = parseLocation(r.Location);
-  const date = parseExcelDate(r['Choose Date'] || r['Date Collected']);
+  const loc = parseLocation(r.Location || r.location || r.GPS);
+  const date = parseExcelDate(
+    r['Choose Date'] || r['Date Collected'] || r['Choose date'] || r.Date || r.date
+  );
   return {
     id: r.ID,
     date: serializeDate(date),
-    auditor: r['Choose Your Name'],
+    auditor: r['Choose Your Name'] || r['Auditor Name'] || r.auditor || r['Employee Name'],
     auditorId: r.User,
     onField: r['Are You on field Today?'] === 'Yes',
     asPerPlan: r["Is today's audit as per planned?"],
@@ -105,23 +107,24 @@ function parsePjpBuffer(buffer) {
     pjpMaxDate = serializeDate(new Date(Math.max(...inMonth.map((d) => d.getTime()))));
   }
 
-  const planByEmpDate = {};
-  const planByNameDate = {};
-  const { normalizeName } = require('./utils');
-  for (const plan of planRows) {
-    if (plan.empCode) planByEmpDate[`${plan.empCode}|${plan.dateKey}`] = plan;
-    if (plan.empName) planByNameDate[`${normalizeName(plan.empName)}|${plan.dateKey}`] = plan;
-  }
-
   return {
     planRows,
     pjpEmpCodes: [...pjpEmpCodes],
     pjpMonth,
     pjpMinDate,
     pjpMaxDate,
-    planByEmpDate,
-    planByNameDate,
   };
+}
+
+function buildPlanIndexes(planRows) {
+  const planByEmpDate = {};
+  const planByNameDate = {};
+  const { normalizeName } = require('./utils');
+  for (const plan of planRows || []) {
+    if (plan.empCode) planByEmpDate[`${plan.empCode}|${plan.dateKey}`] = plan;
+    if (plan.empName) planByNameDate[`${normalizeName(plan.empName)}|${plan.dateKey}`] = plan;
+  }
+  return { planByEmpDate, planByNameDate };
 }
 
 function pickDefaultDate(rawRows, pjpMinDate, pjpMaxDate) {
@@ -140,5 +143,6 @@ function pickDefaultDate(rawRows, pjpMinDate, pjpMaxDate) {
 module.exports = {
   parseAttendanceBuffer,
   parsePjpBuffer,
+  buildPlanIndexes,
   pickDefaultDate,
 };

@@ -10,7 +10,7 @@ const cookieParser = require('cookie-parser');
 
 const { initDb, getPool, ensureSession } = require('./db');
 const AUDITOR_MASTER = require('./data/auditors');
-const { parseAttendanceBuffer, parsePjpBuffer, pickDefaultDate } = require('./lib/excel');
+const { parseAttendanceBuffer, parsePjpBuffer, buildPlanIndexes, pickDefaultDate } = require('./lib/excel');
 const { dateKey } = require('./lib/utils');
 const { rosterAiReview } = require('./lib/claims');
 const { processClaim } = require('./lib/claim-processor');
@@ -135,10 +135,12 @@ function getSessionId(req) {
   return req.headers['x-session-id'] || req.query.sessionId || null;
 }
 
-/** API key pasted in the browser — sent per request, not stored on Render */
+/** Browser header first, then ANTHROPIC_API_KEY on Render (set once in dashboard). */
 function getClientApiKey(req) {
   const h = req.headers['x-anthropic-api-key'];
   if (h && String(h).trim()) return String(h).trim();
+  const env = process.env.ANTHROPIC_API_KEY;
+  if (env && String(env).trim()) return String(env).trim();
   return null;
 }
 
@@ -162,6 +164,7 @@ async function loadWorkspace(sessionId) {
   const rawRows = att.rows[0]?.rows || [];
   const planRows = pjp.rows[0]?.plan_rows || [];
   const meta = pjp.rows[0]?.meta || {};
+  const indexes = buildPlanIndexes(planRows);
 
   return {
     attendanceFileName: att.rows[0]?.filename || null,
@@ -172,8 +175,8 @@ async function loadWorkspace(sessionId) {
     pjpMinDate: meta.pjpMinDate || null,
     pjpMaxDate: meta.pjpMaxDate || null,
     pjpEmpCodes: meta.pjpEmpCodes || [],
-    planByEmpDate: meta.planByEmpDate || {},
-    planByNameDate: meta.planByNameDate || {},
+    planByEmpDate: indexes.planByEmpDate,
+    planByNameDate: indexes.planByNameDate,
     claims: claimsRes.rows.map((r) => r.payload),
   };
 }
@@ -198,21 +201,23 @@ function buildStatePayload(workspace, filteredDate) {
     planByNameDate: workspace.planByNameDate,
     filteredDate: defaultDate,
     claims: workspace.claims,
-    aiKeySource: 'browser',
-    authRequired: !!process.env.APP_PASSWORD,
+    aiKeySource: process.env.ANTHROPIC_API_KEY ? 'server' : 'browser',
+    hasServerApiKey: !!process.env.ANTHROPIC_API_KEY,
+    authRequired: false,
   };
 }
 
 // --- Public / auth routes ---
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.7-main2' });
+  res.json({ ok: true, service: 'sentinel-backend', build: '2026.06.8-main2' });
 });
 
 app.get('/api/config', (_req, res) => {
   res.json({
     authRequired: false,
-    aiKeySource: 'browser',
+    aiKeySource: process.env.ANTHROPIC_API_KEY ? 'server' : 'browser',
+    hasServerApiKey: !!process.env.ANTHROPIC_API_KEY,
   });
 });
 
@@ -241,9 +246,15 @@ app.post('/api/auth/logout', (req, res) => {
 
 // --- Session ---
 
-app.post('/api/session', authRequired, (_req, res) => {
-  const sessionId = crypto.randomUUID();
-  res.json({ sessionId });
+app.post('/api/session', authRequired, async (_req, res) => {
+  try {
+    const sessionId = crypto.randomUUID();
+    await ensureSession(sessionId);
+    res.json({ sessionId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Could not create session' });
+  }
 });
 
 app.get('/api/state', authRequired, async (req, res) => {
@@ -319,8 +330,6 @@ app.post('/api/upload/pjp', authRequired, upload.single('file'), async (req, res
       pjpMinDate: parsed.pjpMinDate,
       pjpMaxDate: parsed.pjpMaxDate,
       pjpEmpCodes: parsed.pjpEmpCodes,
-      planByEmpDate: parsed.planByEmpDate,
-      planByNameDate: parsed.planByNameDate,
     };
 
     await ensureSession(sessionId);
@@ -331,6 +340,7 @@ app.post('/api/upload/pjp', authRequired, upload.single('file'), async (req, res
       [sessionId, req.file.originalname, JSON.stringify(parsed.planRows), JSON.stringify(meta)]
     );
 
+    const indexes = buildPlanIndexes(parsed.planRows);
     const workspace = await loadWorkspace(sessionId);
     const filteredDate = pickDefaultDate(workspace.rawRows, parsed.pjpMinDate, parsed.pjpMaxDate);
     res.json({
@@ -340,6 +350,7 @@ app.post('/api/upload/pjp', authRequired, upload.single('file'), async (req, res
           planRows: parsed.planRows,
           pjpFileName: req.file.originalname,
           ...meta,
+          ...indexes,
         },
         filteredDate
       ),

@@ -8,8 +8,7 @@ This guide walks you through putting the app online on [Render](https://render.c
 
 1. A **GitHub** account with this project pushed to a repository.
 2. A **Render** account (sign up free at [render.com](https://render.com)).
-3. An **Anthropic API key** for AI bill verification ([get one here](https://console.anthropic.com/settings/keys)) — you will paste this **in the browser**, not on Render.
-4. A **password** you will use to log into the dashboard (pick something strong).
+3. An **Anthropic API key** for AI bill verification ([get one here](https://console.anthropic.com/settings/keys)).
 
 ---
 
@@ -40,11 +39,11 @@ After the blueprint is created, open the **sentinel** web service → **Environm
 
 | Variable | What to put |
 |----------|-------------|
-| `APP_PASSWORD` | The password you want for logging into Sentinel |
+| `ANTHROPIC_API_KEY` | Your `sk-ant-...` key — **recommended** so you do not need to paste it every day |
 
 `DATABASE_URL` and `SESSION_SECRET` are filled in automatically by the blueprint.
 
-**Do not** set `ANTHROPIC_API_KEY` on Render. Each user pastes their own key in the app using the **AI Key** chip in the header after logging in.
+`APP_PASSWORD` is optional (login is disabled by default). If set, it is ignored on the current build.
 
 Click **Save Changes**. Render will redeploy the service.
 
@@ -54,9 +53,8 @@ Click **Save Changes**. Render will redeploy the service.
 
 1. On the **sentinel** service page, copy the URL (e.g. `https://sentinel-xxxx.onrender.com`).
 2. Open that URL in your browser.
-3. Log in with the **APP_PASSWORD** you set.
-4. Click **AI Key** in the header and paste your Anthropic key (`sk-ant-...`).
-5. Upload your **Attendance** and **PJP** Excel files as before.
+3. If **AI Key** shows “Server (Render)”, your `ANTHROPIC_API_KEY` is active. Otherwise click **AI Key** once and paste your key — it is saved in the browser (`localStorage`) for future visits.
+4. Upload your **Attendance** and **PJP** Excel files as before.
 
 Data and claims are saved in the database and survive browser refresh.
 
