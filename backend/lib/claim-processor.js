@@ -1,6 +1,7 @@
 const { getPool } = require('../db');
 const { applyRuleChecks, verifyClaimWithAI, mergeAiVerdict, buildIndexes } = require('./claims');
 const { extractBillOcr, hashBillDataUrl } = require('./ocr');
+const { isBillAiVerifiable } = require('./bill-media');
 const {
   runExpenseValidationChecks,
   applyValidationFlagsToClaim,
@@ -29,10 +30,9 @@ async function processClaim(claim, workspace, sessionId, { apiKey, skipAi = fals
     existingClaims: workspace.claims.filter((c) => c.id !== claim.id),
   });
 
-  const isImage =
-    claim.billDataUrl && claim.billMimeType && String(claim.billMimeType).startsWith('image/');
+  const canProcessBill = isBillAiVerifiable(claim);
 
-  if (isImage && key) {
+  if (canProcessBill && key) {
     try {
       claim.ocr = await extractBillOcr(claim, key);
       if (claim.ocr) {
@@ -54,7 +54,7 @@ async function processClaim(claim, workspace, sessionId, { apiKey, skipAi = fals
   runExpenseValidationChecks(claim, registry);
   applyValidationFlagsToClaim(claim);
 
-  const canAi = !skipAi && key && isImage;
+  const canAi = !skipAi && key && canProcessBill;
   if (canAi) {
     try {
       claim.aiResult = await verifyClaimWithAI(claim, key);
@@ -63,18 +63,19 @@ async function processClaim(claim, workspace, sessionId, { apiKey, skipAi = fals
     } catch (err) {
       claim.aiError = err.message;
       if (claim.verdict === 'pending' || claim.verdict === 'genuine') claim.verdict = 'review';
-      const aiNote = `Bill image could not be verified by AI (${err.message}). Rule-based and OCR checks still applied.`;
+      const aiNote = `Bill could not be verified by AI (${err.message}). Rule-based and OCR checks still applied.`;
       claim.verdictDetails = claim.verdictDetails ? `${claim.verdictDetails} ${aiNote}` : aiNote;
     }
   } else if (!claim.billDataUrl) {
     if (claim.verdict === 'pending') claim.verdict = 'review';
     claim.verdictDetails =
       claim.verdictDetails ||
-      'No bill image — OCR and AI skipped. Validation used rules and registry checks only.';
-  } else if (!isImage) {
+      'No bill attached — OCR and AI skipped. Validation used rules and registry checks only.';
+  } else if (!canProcessBill) {
     if (claim.verdict === 'pending') claim.verdict = 'review';
     claim.verdictDetails =
-      claim.verdictDetails || 'Non-image bill — OCR/AI vision skipped.';
+      claim.verdictDetails ||
+      'Unsupported bill format — use PDF, image (JPG/PNG), or Excel.';
   } else if (!key) {
     if (claim.verdict === 'pending') claim.verdict = 'review';
     claim.verdictDetails =

@@ -2,6 +2,7 @@ const AUDITOR_MASTER = require('../data/auditors');
 const { buildAuditorIndex, findAuditor, dateKey } = require('./utils');
 const { haversineKm, resolveCityCoords, nearestCityName } = require('./geo');
 const { callAnthropic, parseJsonFromModel } = require('./anthropic');
+const { buildBillAnthropicContent } = require('./bill-media');
 
 const DA_CAPS = { metro: 525, non_metro: 450 };
 const auditorIndex = buildAuditorIndex(AUDITOR_MASTER);
@@ -150,12 +151,7 @@ function applyRuleChecks(claim, ctx) {
 }
 
 async function verifyClaimWithAI(claim, apiKey) {
-  const dataUrl = claim.billDataUrl;
-  if (!dataUrl) throw new Error('No bill image');
-  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-  if (!m) throw new Error('Invalid image data');
-  const mediaType = m[1];
-  const base64 = m[2];
+  if (!claim.billDataUrl) throw new Error('No bill attached');
 
   const geoBlock = claim.geo
     ? `
@@ -168,7 +164,7 @@ ${claim.geo.plannedTown ? `- Distance from planned audit town (${claim.geo.plann
 `
     : '';
 
-  const prompt = `You are a bill-verification AI agent for an expense reimbursement system. Examine the attached bill image and verify it against the claim details below.
+  const prompt = `You are a bill-verification AI agent for an expense reimbursement system. Examine the attached bill (image, PDF, or spreadsheet) and verify it against the claim details below.
 
 Claim details:
 - Auditor: ${claim.auditorName} (${claim.auditorCode})
@@ -187,7 +183,7 @@ ${claim.ocr ? `OCR already extracted:
 - Vendor: ${claim.ocr.vendor || 'unknown'}
 - OCR confidence: ${claim.ocr.confidence != null ? (claim.ocr.confidence * 100).toFixed(0) + '%' : 'unknown'}
 ` : ''}
-Examine the bill image carefully and respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
+Examine the bill carefully and respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
 {
   "billDate": "YYYY-MM-DD or null if illegible",
   "billAmount": number or null,
@@ -207,10 +203,7 @@ Examine the bill image carefully and respond ONLY with a JSON object in this exa
   const text = await callAnthropic({
     apiKey,
     maxTokens: 1024,
-    userContent: [
-      { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-      { type: 'text', text: prompt },
-    ],
+    userContent: buildBillAnthropicContent(claim, prompt),
   });
 
   return parseJsonFromModel(text);

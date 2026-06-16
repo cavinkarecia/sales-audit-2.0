@@ -1,4 +1,5 @@
 const { normalizeTransactionId, hashBillDataUrl } = require('./ocr');
+const { isBillAiVerifiable } = require('./bill-media');
 
 const TIME_WINDOW_MS = (parseInt(process.env.CLAIM_TIME_WINDOW_MINUTES, 10) || 10) * 60 * 1000;
 const BILL_MAX_AGE_DAYS = parseInt(process.env.BILL_MAX_AGE_DAYS, 10) || 3;
@@ -50,11 +51,11 @@ function runExpenseValidationChecks(claim, registry) {
     });
   }
 
-  if (!claim.ocr && claim.billDataUrl && claim.billMimeType?.startsWith('image/')) {
+  if (!claim.ocr && claim.billDataUrl && isBillAiVerifiable(claim)) {
     flags.push({
       code: 'OCR_MISSING',
       severity: 'review',
-      message: 'Bill image present but OCR extraction failed or was skipped.',
+      message: 'Bill attached but OCR extraction failed or was skipped.',
     });
   }
 

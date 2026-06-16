@@ -21,6 +21,7 @@ const {
 const { dateKey } = require('./lib/utils');
 const { rosterAiReview } = require('./lib/claims');
 const { processClaim } = require('./lib/claim-processor');
+const { isBillAiVerifiable } = require('./lib/bill-media');
 const {
   extractBillsFromBulkPdfBuffer,
   buildClaimFromExtractedBill,
@@ -339,7 +340,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.06.23-main',
+    build: '2026.06.25-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -604,7 +605,7 @@ app.post('/api/upload/pjp', authRequired, upload.single('file'), async (req, res
 
 // --- Claims ---
 
-const MAX_BILL_DATA_URL_LEN = 6_000_000;
+const MAX_BILL_DATA_URL_LEN = 12_000_000;
 
 /** Claims list / rules — never load bill images from PostgreSQL into memory. */
 async function loadSlimClaimRows(sessionId, limit = 300) {
@@ -731,7 +732,7 @@ app.post('/api/claims', authRequired, async (req, res) => {
 
     if (req.body?.billDataUrl && String(req.body.billDataUrl).length > MAX_BILL_DATA_URL_LEN) {
       return res.status(400).json({
-        error: 'Bill image is too large. Compress the photo or use a smaller screenshot (max ~4 MB).',
+        error: 'Bill file is too large. Use a smaller PDF/image (max ~8 MB) or compress the file.',
       });
     }
 
@@ -746,8 +747,7 @@ app.post('/api/claims', authRequired, async (req, res) => {
     };
 
     const apiKey = getClientApiKey(req);
-    const isImage =
-      claim.billDataUrl && claim.billMimeType && String(claim.billMimeType).startsWith('image/');
+    const canVerifyBill = isBillAiVerifiable(claim);
     // Save quickly with rules/registry only — AI/OCR runs via /verify (avoids Render 502 timeouts).
     await processClaim(claim, workspace, sessionId, { apiKey, skipAi: true });
 
@@ -762,7 +762,7 @@ app.post('/api/claims', authRequired, async (req, res) => {
       ...slimClaimForClient(claim),
       billDataUrl: claim.billDataUrl || null,
     };
-    res.status(201).json({ claim: clientClaim, verifySuggested: !!(isImage && apiKey) });
+    res.status(201).json({ claim: clientClaim, verifySuggested: !!(canVerifyBill && apiKey) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Failed to save claim' });

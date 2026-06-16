@@ -1,8 +1,9 @@
 const crypto = require('crypto');
 const { callAnthropic, parseJsonFromModel } = require('./anthropic');
+const { buildBillAnthropicContent } = require('./bill-media');
 
-const OCR_PROMPT = `You are an OCR engine for Indian expense receipts and travel bills.
-Extract every visible field from the bill image with high accuracy.
+const OCR_PROMPT = `You are an OCR engine for Indian expense receipts and travel bills (image, PDF, or spreadsheet export).
+Extract every visible field from the bill with high accuracy.
 
 Respond ONLY with JSON (no markdown):
 {
@@ -16,20 +17,12 @@ Respond ONLY with JSON (no markdown):
 }`;
 
 async function extractBillOcr(claim, apiKey) {
-  const dataUrl = claim.billDataUrl;
-  if (!dataUrl) return null;
-  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-  if (!m) throw new Error('Invalid bill image data');
-  const mediaType = m[1];
-  const base64 = m[2];
+  if (!claim.billDataUrl) return null;
 
   const text = await callAnthropic({
     apiKey,
     maxTokens: 800,
-    userContent: [
-      { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-      { type: 'text', text: OCR_PROMPT },
-    ],
+    userContent: buildBillAnthropicContent(claim, OCR_PROMPT),
   });
 
   const parsed = parseJsonFromModel(text);

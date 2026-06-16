@@ -713,7 +713,28 @@ html, body {
 }
 .claim-body { flex: 1; min-width: 0; }
 .claim-head {
-  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  display: flex; justify-content: space-between; align-items: flex-start; gap: 8px;
+}
+.claim-head-actions {
+  display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0;
+}
+.claim-delete-btn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: inherit;
+}
+.claim-delete-btn:hover {
+  border-color: var(--red);
+  color: var(--red);
+  background: rgba(239,68,68,0.08);
 }
 .claim-title { font-weight: 600; font-size: 13px; }
 .claim-meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
@@ -1475,11 +1496,11 @@ html, body {
       <div class="form-row">
         <label class="form-label">Bill / receipt <span class="required">*</span></label>
         <div class="bill-drop" id="bill-drop">
-          <input type="file" id="bill-input" accept="image/*,application/pdf" style="display:none" />
+          <input type="file" id="bill-input" accept="image/*,application/pdf,.pdf,.xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="display:none" />
           <div id="bill-empty-msg">
             <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--text-dim);margin-bottom:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
             <div style="font-size:13px;font-weight:500">Click to upload bill</div>
-            <div style="font-size:11px;color:var(--text-dim);margin-top:2px">JPG, PNG, or PDF · up to 5 MB</div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:2px">PDF, JPG, PNG, WEBP, or Excel · up to 8 MB</div>
           </div>
         </div>
       </div>
@@ -1618,7 +1639,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.23';
+const SENTINEL_BUILD = '2026.06.25';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -5178,9 +5199,69 @@ function updateAmountHelp() {
   }
 }
 
-// Bill upload (image / PDF)
+// Bill upload (image / PDF / Excel)
 let pendingBillFile = null;
 let pendingBillDataUrl = null;
+
+function parseBillDataUrlClient(dataUrl) {
+  if (!dataUrl) return null;
+  const m = String(dataUrl).match(/^data:([^;]+);base64,(.+)$/s);
+  if (!m) return null;
+  return { mediaType: m[1].trim(), base64: m[2] };
+}
+
+function resolveBillMimeClient(claimOrFile) {
+  const fileName = (claimOrFile.billFileName || claimOrFile.name || '').toLowerCase();
+  let mediaType = String(claimOrFile.billMimeType || claimOrFile.type || '').trim();
+  if (!mediaType || mediaType === 'application/octet-stream') {
+    if (fileName.endsWith('.pdf')) mediaType = 'application/pdf';
+    else if (/\.(jpe?g)$/.test(fileName)) mediaType = 'image/jpeg';
+    else if (fileName.endsWith('.png')) mediaType = 'image/png';
+    else if (/\.xlsx?$/.test(fileName)) mediaType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+    else if (fileName.endsWith('.csv')) mediaType = 'text/csv';
+  }
+  return { mediaType, fileName };
+}
+
+function isBillAiVerifiableClient(claimOrFile) {
+  const dataUrl = claimOrFile.billDataUrl || claimOrFile;
+  if (!dataUrl && !claimOrFile?.name) return false;
+  const { mediaType, fileName } = resolveBillMimeClient(claimOrFile);
+  if (mediaType.startsWith('image/')) return true;
+  if (mediaType === 'application/pdf' || fileName.endsWith('.pdf')) return true;
+  if (/spreadsheet|excel|csv|sheet|ms-excel/i.test(mediaType) || /\.(xlsx?|csv)$/i.test(fileName)) return true;
+  return false;
+}
+
+function buildBillAnthropicContentClient(claim, textPrompt) {
+  const parsed = parseBillDataUrlClient(claim.billDataUrl);
+  if (!parsed?.base64) throw new Error('Invalid bill file data');
+  const { mediaType, fileName } = resolveBillMimeClient(claim);
+  const content = [];
+  if (mediaType === 'application/pdf' || fileName.endsWith('.pdf')) {
+    content.push({
+      type: 'document',
+      source: { type: 'base64', media_type: 'application/pdf', data: parsed.base64 },
+    });
+  } else if (mediaType.startsWith('image/')) {
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: mediaType, data: parsed.base64 },
+    });
+  } else {
+    throw new Error('Spreadsheet bills are verified on the server. Use Server mode or export as PDF/image.');
+  }
+  content.push({ type: 'text', text: textPrompt });
+  return content;
+}
+
+function billFileKindLabel(file) {
+  const { mediaType, fileName } = resolveBillMimeClient(file);
+  if (mediaType === 'application/pdf' || fileName.endsWith('.pdf')) return 'PDF';
+  if (/spreadsheet|excel|csv|sheet/i.test(mediaType) || /\.(xlsx?|csv)$/i.test(fileName)) return 'Excel';
+  if (mediaType.startsWith('image/')) return 'Image';
+  return 'File';
+}
 
 $('bill-drop').addEventListener('click', () => $('bill-input').click());
 $('bill-input').addEventListener('change', (e) => {
@@ -5192,11 +5273,11 @@ function resetBillUpload() {
   pendingBillDataUrl = null;
   $('bill-drop').classList.remove('has-file');
   $('bill-drop').innerHTML = `
-    <input type="file" id="bill-input" accept="image/*,application/pdf" style="display:none" />
+    <input type="file" id="bill-input" accept="image/*,application/pdf,.pdf,.xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="display:none" />
     <div id="bill-empty-msg">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--text-dim);margin-bottom:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       <div style="font-size:13px;font-weight:500">Click to upload bill</div>
-      <div style="font-size:11px;color:var(--text-dim);margin-top:2px">JPG, PNG, or PDF · up to 5 MB</div>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:2px">PDF, JPG, PNG, WEBP, or Excel · up to 8 MB</div>
     </div>
   `;
   // Re-attach listener since we replaced the input
@@ -5206,12 +5287,18 @@ function resetBillUpload() {
 }
 
 async function loadBillFile(file) {
-  if (file.size > 5 * 1024 * 1024) { alert('File too large (>5MB). Please compress and try again.'); return; }
+  const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+  const maxBytes = isPdf ? 8 * 1024 * 1024 : 5 * 1024 * 1024;
+  if (file.size > maxBytes) {
+    alert(`File too large (max ${isPdf ? '8' : '5'} MB). Please compress and try again.`);
+    return;
+  }
   pendingBillFile = file;
   const reader = new FileReader();
   reader.onload = (e) => {
     pendingBillDataUrl = e.target.result;
     const isImage = file.type.startsWith('image/');
+    const kind = billFileKindLabel(file);
     const drop = $('bill-drop');
     drop.classList.add('has-file');
     drop.innerHTML = `
@@ -5221,7 +5308,7 @@ async function loadBillFile(file) {
         </div>
         <div class="bill-info">
           <div class="bill-name">${escapeHtml(file.name)}</div>
-          <div class="bill-meta">${(file.size / 1024).toFixed(1)} KB · ${file.type || 'unknown type'}</div>
+          <div class="bill-meta">${kind} · ${(file.size / 1024).toFixed(1)} KB</div>
         </div>
         <button class="btn" id="bill-replace" type="button">Replace</button>
       </div>
@@ -5433,8 +5520,8 @@ $('claim-submit').addEventListener('click', async () => {
   if (!USE_BACKEND) applyRuleChecks(claim);
 
   if (USE_BACKEND) {
-    if (pendingBillFile && pendingBillFile.type.startsWith('image/') && !hasAiKeyReady()) {
-      alert('Paste your Anthropic API key first (AI Key chip in the header) to verify bill images.');
+    if (pendingBillFile && isBillAiVerifiableClient({ billDataUrl: pendingBillDataUrl, billMimeType: pendingBillFile.type, billFileName: pendingBillFile.name }) && !hasAiKeyReady()) {
+      alert('Paste your Anthropic API key first (AI Key chip in the header) to verify bills with AI.');
       return;
     }
     closeClaimModal();
@@ -5458,9 +5545,12 @@ $('claim-submit').addEventListener('click', async () => {
       renderClaimsList();
       renderExpenseValidationStats();
       if (data.verifySuggested && saved.billDataUrl) {
+        saved.verdict = 'pending';
+        saved.verdictDetails = 'AI analyzing bill…';
+        renderClaimsList();
         verifyClaimWithAI(saved)
           .then(() => {
-            mergeAiVerdict(saved);
+            if (!USE_BACKEND) mergeAiVerdict(saved);
             renderClaimsList();
             renderExpenseValidationStats();
           })
@@ -5482,8 +5572,10 @@ $('claim-submit').addEventListener('click', async () => {
   renderClaimsList();
   closeClaimModal();
 
-  // Run AI verification in background (only if bill is an image)
-  if (pendingBillDataUrl && pendingBillFile && pendingBillFile.type.startsWith('image/')) {
+  // Run AI verification in background (image or PDF)
+  if (pendingBillDataUrl && pendingBillFile && isBillAiVerifiableClient({ billDataUrl: pendingBillDataUrl, billMimeType: pendingBillFile.type, billFileName: pendingBillFile.name })) {
+    claim.verdict = 'pending';
+    claim.verdictDetails = 'AI analyzing bill…';
     verifyClaimWithAI(claim).then(() => {
       mergeAiVerdict(claim);
       runClientExpenseValidation(claim);
@@ -5498,14 +5590,14 @@ $('claim-submit').addEventListener('click', async () => {
   } else if (!pendingBillDataUrl) {
     const hasGeofenceFlag = claim.concerns.some(c => /GEOFENCE|geofenc/i.test(c));
     claim.verdict = hasGeofenceFlag ? 'suspicious' : 'review';
-    claim.verdictDetails = 'No bill image attached — AI verification skipped. ' + (hasGeofenceFlag ? 'Rule-based checks flagged this claim.' : 'Manual review required.');
+    claim.verdictDetails = 'No bill attached — AI verification skipped. ' + (hasGeofenceFlag ? 'Rule-based checks flagged this claim.' : 'Manual review required.');
     runClientExpenseValidation(claim);
     renderClaimsList();
     renderExpenseValidationStats();
   } else {
     const hasGeofenceFlag = claim.concerns.some(c => /GEOFENCE|geofenc/i.test(c));
     claim.verdict = hasGeofenceFlag ? 'suspicious' : 'review';
-    claim.verdictDetails = 'Bill is a PDF; AI vision verifies images only. ' + (hasGeofenceFlag ? 'Rule-based checks flagged this claim.' : 'Please review manually.');
+    claim.verdictDetails = 'Unsupported bill format — use PDF, image, or Excel (server mode for Excel).';
     runClientExpenseValidation(claim);
     renderClaimsList();
     renderExpenseValidationStats();
@@ -5655,13 +5747,7 @@ async function verifyClaimWithAI(claim) {
     headers['x-api-key'] = STATE.claudeApiKey;
   }
 
-  // Extract base64 image data
-  const dataUrl = claim.billDataUrl;
-  if (!dataUrl) throw new Error('No bill image');
-  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/);
-  if (!m) throw new Error('Invalid image data');
-  const mediaType = m[1];
-  const base64 = m[2];
+  if (!claim.billDataUrl) throw new Error('No bill attached');
 
   const geoBlock = claim.geo ? `
 
@@ -5672,7 +5758,7 @@ ${claim.geo.plannedTown ? `- Distance from planned audit town (${claim.geo.plann
 - Attendance status: ${claim.geo.onField ? 'On field' : 'Off field / absent'}
 ` : '';
 
-  const prompt = `You are a bill-verification AI agent for an expense reimbursement system. Examine the attached bill image and verify it against the claim details below.
+  const prompt = `You are a bill-verification AI agent for an expense reimbursement system. Examine the attached bill (image or PDF) and verify it against the claim details below.
 
 Claim details:
 - Auditor: ${claim.auditorName} (${claim.auditorCode})
@@ -5684,7 +5770,7 @@ Claim details:
 ${claim.reason ? `- Reason for external booking: ${claim.reason}` : ''}
 ${claim.notes ? `- Notes: ${claim.notes}` : ''}${geoBlock}
 
-Examine the bill image carefully and respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
+Examine the bill carefully and respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
 {
   "billDate": "YYYY-MM-DD or null if illegible",
   "billAmount": number or null,
@@ -5714,10 +5800,7 @@ Strict rules:
     max_tokens: 1024,
     messages: [{
       role: 'user',
-      content: [
-        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
-        { type: 'text', text: prompt },
-      ],
+      content: buildBillAnthropicContentClient(claim, prompt),
     }],
   };
 
@@ -5822,6 +5905,10 @@ function renderClaimsList() {
 
   list.innerHTML = filtered.map(c => {
     const isImage = c.billMimeType && c.billMimeType.startsWith('image/');
+    const fn = (c.billFileName || '').toLowerCase();
+    const isPdf = c.billMimeType === 'application/pdf' || fn.endsWith('.pdf');
+    const isExcel = /spreadsheet|excel|csv|sheet|ms-excel/i.test(c.billMimeType || '') || /\.(xlsx?|csv)$/i.test(fn);
+    const billKind = isImage ? 'image' : isPdf ? 'pdf' : isExcel ? 'excel' : 'file';
     const verdictMap = {
       pending: { label: 'AI verifying...', icon: '<span class="ai-spinner"></span>' },
       genuine: { label: 'Verified genuine', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="20 6 9 17 4 12"/></svg>' },
@@ -5837,8 +5924,8 @@ function renderClaimsList() {
 
     return `
       <div class="claim-card">
-        <div class="claim-thumb ${isImage ? '' : 'no-img'}" ${isImage ? `style="background-image:url('${c.billDataUrl}')"` : ''}>
-          ${isImage ? '' : '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'}
+        <div class="claim-thumb ${isImage ? '' : 'no-img'}" ${isImage ? `style="background-image:url('${c.billDataUrl}')"` : ''} title="${billKind}">
+          ${isImage ? '' : `<span style="font-size:10px;font-weight:600;text-transform:uppercase;color:var(--text-dim)">${isPdf ? 'PDF' : isExcel ? 'Excel' : 'Bill'}</span>`}
         </div>
         <div class="claim-body">
           <div class="claim-head">
@@ -5846,7 +5933,13 @@ function renderClaimsList() {
               <div class="claim-title">${escapeHtml(c.auditorName)} · ${escapeHtml(c.cluster)}</div>
               <div class="claim-meta">${escapeHtml(c.id)} · ${dateStr} · ${subPill}</div>
             </div>
-            <div class="claim-amount">₹${c.amount.toLocaleString('en-IN')}</div>
+            <div class="claim-head-actions">
+              <div class="claim-amount">₹${c.amount.toLocaleString('en-IN')}</div>
+              <button type="button" class="claim-delete-btn" title="Delete claim" aria-label="Delete claim" onclick="deleteClaim('${c.id}')">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+                Delete
+              </button>
+            </div>
           </div>
           ${c.reason ? `<div class="claim-detail">Portal-bypass reason: <em>${escapeHtml(c.reason)}</em></div>` : ''}
           ${c.notes ? `<div class="claim-detail">Notes: ${escapeHtml(c.notes)}</div>` : ''}
@@ -5895,11 +5988,39 @@ function renderClaimsList() {
 }
 
 // Re-verify a previously-failed claim (e.g., after fixing the API key)
+async function deleteClaim(claimId) {
+  const claim = STATE.claims.find(c => c.id === claimId);
+  if (!claim) return;
+
+  const dateStr = new Date(claim.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+  const summary = `${claim.auditorName} · ₹${claim.amount.toLocaleString('en-IN')} · ${dateStr} · ${claim.id}`;
+  if (!confirm(`Delete this expense claim?\n\n${summary}\n\nThis cannot be undone.`)) return;
+
+  if (USE_BACKEND) {
+    try {
+      await ensureBackendSession();
+      const resp = await apiFetch(`/api/claims/${encodeURIComponent(claimId)}`, { method: 'DELETE' });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        alert(data.error || `Could not delete claim (HTTP ${resp.status})`);
+        return;
+      }
+    } catch (err) {
+      alert(err?.message || 'Could not delete claim. Check your connection and try again.');
+      return;
+    }
+  }
+
+  STATE.claims = STATE.claims.filter(c => c.id !== claimId);
+  renderClaimsList();
+  renderExpenseValidationStats();
+}
+
 async function reverifyClaim(claimId) {
   const claim = STATE.claims.find(c => c.id === claimId);
   if (!claim) return;
-  if (!claim.billDataUrl || !claim.billMimeType || !claim.billMimeType.startsWith('image/')) {
-    alert('Re-verification only works for image bills.');
+  if (!claim.billDataUrl || !isBillAiVerifiableClient(claim)) {
+    alert('Re-verification requires a PDF, image, or Excel bill.');
     return;
   }
   claim.aiError = null;
