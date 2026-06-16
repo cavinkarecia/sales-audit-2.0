@@ -763,6 +763,26 @@ html, body {
 .claim-verdict-title svg { width: 13px; height: 13px; }
 .claim-concerns { margin-top: 6px; padding-left: 12px; }
 .claim-concerns li { margin: 2px 0; }
+.claim-processing-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--blue);
+  background: rgba(59, 130, 246, 0.1);
+  border: 1px solid rgba(59, 130, 246, 0.28);
+}
+.claim-card.is-processing {
+  border-color: rgba(59, 130, 246, 0.35);
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.08);
+}
+.bill-preview-loading {
+  justify-content: flex-start;
+}
 
 .policy-banner {
   background: rgba(59, 130, 246, 0.08);
@@ -1639,7 +1659,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.25';
+const SENTINEL_BUILD = '2026.06.26';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -4178,6 +4198,7 @@ function renderExpenseView() {
 
   // Save for filter handlers
   STATE._expenseRows = expenseRows;
+  renderClaimsList();
   renderExpenseValidationStats();
 }
 
@@ -5263,27 +5284,66 @@ function billFileKindLabel(file) {
   return 'File';
 }
 
-$('bill-drop').addEventListener('click', () => $('bill-input').click());
-$('bill-input').addEventListener('change', (e) => {
-  if (e.target.files.length) loadBillFile(e.target.files[0]);
+const BILL_INPUT_ACCEPT = 'image/*,application/pdf,.pdf,.xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel';
+
+function ensureBillInput() {
+  let input = $('bill-input');
+  if (!input) {
+    input = document.createElement('input');
+    input.type = 'file';
+    input.id = 'bill-input';
+    input.accept = BILL_INPUT_ACCEPT;
+    input.style.display = 'none';
+    $('bill-drop').appendChild(input);
+    input.addEventListener('change', (e) => {
+      if (e.target.files.length) loadBillFile(e.target.files[0]);
+      e.target.value = '';
+    });
+  }
+  return input;
+}
+
+function renderBillPreview(file, kind) {
+  const isImage = file.type.startsWith('image/');
+  const drop = $('bill-drop');
+  drop.classList.add('has-file');
+  drop.innerHTML = `
+    <div class="bill-preview">
+      <div class="bill-thumb" style="${isImage ? `background-image:url('${pendingBillDataUrl}')` : ''}">
+        ${isImage ? '' : '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'}
+      </div>
+      <div class="bill-info">
+        <div class="bill-name">${escapeHtml(file.name)}</div>
+        <div class="bill-meta">${kind} · ${(file.size / 1024).toFixed(1)} KB · ready</div>
+      </div>
+      <button class="btn" id="bill-replace" type="button">Replace</button>
+    </div>
+  `;
+  ensureBillInput();
+  $('bill-replace').addEventListener('click', (e) => {
+    e.stopPropagation();
+    ensureBillInput().click();
+  });
+}
+
+$('bill-drop').addEventListener('click', (e) => {
+  if (e.target.closest('#bill-replace')) return;
+  ensureBillInput().click();
 });
 
 function resetBillUpload() {
   pendingBillFile = null;
   pendingBillDataUrl = null;
-  $('bill-drop').classList.remove('has-file');
-  $('bill-drop').innerHTML = `
-    <input type="file" id="bill-input" accept="image/*,application/pdf,.pdf,.xlsx,.xls,.csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" style="display:none" />
+  const drop = $('bill-drop');
+  drop.classList.remove('has-file');
+  drop.innerHTML = `
     <div id="bill-empty-msg">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" style="color:var(--text-dim);margin-bottom:6px"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       <div style="font-size:13px;font-weight:500">Click to upload bill</div>
       <div style="font-size:11px;color:var(--text-dim);margin-top:2px">PDF, JPG, PNG, WEBP, or Excel · up to 8 MB</div>
     </div>
   `;
-  // Re-attach listener since we replaced the input
-  $('bill-input').addEventListener('change', (e) => {
-    if (e.target.files.length) loadBillFile(e.target.files[0]);
-  });
+  ensureBillInput();
 }
 
 async function loadBillFile(file) {
@@ -5294,29 +5354,28 @@ async function loadBillFile(file) {
     return;
   }
   pendingBillFile = file;
+  const kind = billFileKindLabel(file);
+  const drop = $('bill-drop');
+  drop.classList.add('has-file');
+  drop.innerHTML = `
+    <div class="bill-preview bill-preview-loading">
+      <span class="ai-spinner" style="width:20px;height:20px;flex-shrink:0"></span>
+      <div class="bill-info">
+        <div class="bill-name">${escapeHtml(file.name)}</div>
+        <div class="bill-meta">Reading ${kind}…</div>
+      </div>
+    </div>
+  `;
+  ensureBillInput();
+
   const reader = new FileReader();
   reader.onload = (e) => {
     pendingBillDataUrl = e.target.result;
-    const isImage = file.type.startsWith('image/');
-    const kind = billFileKindLabel(file);
-    const drop = $('bill-drop');
-    drop.classList.add('has-file');
-    drop.innerHTML = `
-      <div class="bill-preview">
-        <div class="bill-thumb" style="${isImage ? `background-image:url('${pendingBillDataUrl}')` : ''}">
-          ${isImage ? '' : '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'}
-        </div>
-        <div class="bill-info">
-          <div class="bill-name">${escapeHtml(file.name)}</div>
-          <div class="bill-meta">${kind} · ${(file.size / 1024).toFixed(1)} KB</div>
-        </div>
-        <button class="btn" id="bill-replace" type="button">Replace</button>
-      </div>
-    `;
-    $('bill-replace').addEventListener('click', (e) => {
-      e.stopPropagation();
-      $('bill-input').click();
-    });
+    renderBillPreview(file, kind);
+  };
+  reader.onerror = () => {
+    alert('Could not read the bill file. Please try again.');
+    resetBillUpload();
   };
   reader.readAsDataURL(file);
 }
@@ -5520,11 +5579,17 @@ $('claim-submit').addEventListener('click', async () => {
   if (!USE_BACKEND) applyRuleChecks(claim);
 
   if (USE_BACKEND) {
-    if (pendingBillFile && isBillAiVerifiableClient({ billDataUrl: pendingBillDataUrl, billMimeType: pendingBillFile.type, billFileName: pendingBillFile.name }) && !hasAiKeyReady()) {
+    if (pendingBillFile && shouldVerifyBillForClaim(claim) && !hasAiKeyReady()) {
       alert('Paste your Anthropic API key first (AI Key chip in the header) to verify bills with AI.');
       return;
     }
+
     closeClaimModal();
+    resetBillUpload();
+    STATE.claims.unshift(claim);
+    STATE._claimsLoaded = true;
+    markClaimProcessing(claim, 'Submitting claim…');
+
     try {
       await ensureBackendSession();
       const resp = await apiFetch('/api/claims', {
@@ -5536,58 +5601,53 @@ $('claim-submit').addEventListener('click', async () => {
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok) {
+        STATE.claims = STATE.claims.filter(c => c.id !== claim.id);
+        renderClaimsList();
         alert(data.error || `Could not save claim (HTTP ${resp.status}). Server may be overloaded — try again in a minute.`);
         return;
       }
+
       const saved = data.claim || data;
-      STATE.claims.unshift(saved);
-      STATE._claimsLoaded = true;
+      Object.assign(claim, saved, {
+        billDataUrl: saved.billDataUrl || claim.billDataUrl,
+        billMimeType: saved.billMimeType || claim.billMimeType,
+        billFileName: saved.billFileName || claim.billFileName,
+      });
       renderClaimsList();
       renderExpenseValidationStats();
-      if (data.verifySuggested && saved.billDataUrl) {
-        saved.verdict = 'pending';
-        saved.verdictDetails = 'AI analyzing bill…';
+
+      if (data.verifySuggested && shouldVerifyBillForClaim(claim)) {
+        await runClaimVerifyAndRefresh(claim);
+      } else {
+        claim._processing = false;
         renderClaimsList();
-        verifyClaimWithAI(saved)
-          .then(() => {
-            if (!USE_BACKEND) mergeAiVerdict(saved);
-            renderClaimsList();
-            renderExpenseValidationStats();
-          })
-          .catch((err) => {
-            console.warn('Bill verify:', err);
-            saved.aiError = err.message;
-            renderClaimsList();
-          });
       }
     } catch (err) {
       console.error(err);
+      const live = findClaimInState(claim.id);
+      if (live) {
+        live._processing = false;
+        live.verdict = 'review';
+        live.verdictDetails = err?.message || 'Could not submit claim. Check connection and try again.';
+        renderClaimsList();
+      }
       alert(err?.message || 'Could not submit claim. Check connection and try again.');
     }
-    resetBillUpload();
     return;
   }
 
-  STATE.claims.unshift(claim);
-  renderClaimsList();
   closeClaimModal();
+  resetBillUpload();
+  STATE.claims.unshift(claim);
+  markClaimProcessing(claim, 'Submitting claim…');
 
-  // Run AI verification in background (image or PDF)
-  if (pendingBillDataUrl && pendingBillFile && isBillAiVerifiableClient({ billDataUrl: pendingBillDataUrl, billMimeType: pendingBillFile.type, billFileName: pendingBillFile.name })) {
-    claim.verdict = 'pending';
-    claim.verdictDetails = 'AI analyzing bill…';
-    verifyClaimWithAI(claim).then(() => {
-      mergeAiVerdict(claim);
-      runClientExpenseValidation(claim);
-      renderClaimsList();
-      renderExpenseValidationStats();
-    }).catch(err => {
-      console.error(err);
-      claim.aiError = err.message || String(err);
-      claim.verdict = claim.verdict === 'pending' ? 'review' : claim.verdict;
-      renderClaimsList();
-    });
-  } else if (!pendingBillDataUrl) {
+  if (shouldVerifyBillForClaim(claim)) {
+    await runClaimVerifyAndRefresh(claim);
+    return;
+  }
+
+  claim._processing = false;
+  if (!claim.billDataUrl) {
     const hasGeofenceFlag = claim.concerns.some(c => /GEOFENCE|geofenc/i.test(c));
     claim.verdict = hasGeofenceFlag ? 'suspicious' : 'review';
     claim.verdictDetails = 'No bill attached — AI verification skipped. ' + (hasGeofenceFlag ? 'Rule-based checks flagged this claim.' : 'Manual review required.');
@@ -5882,6 +5942,53 @@ function mergeAiVerdict(claim) {
   if (!claim.ocr) claim.ocr = ocrFromAiResult(ai);
 }
 
+function findClaimInState(claimId) {
+  return STATE.claims.find(c => c.id === claimId) || null;
+}
+
+function scrollToClaimCard(claimId) {
+  requestAnimationFrame(() => {
+    const el = document.getElementById(`claim-card-${claimId}`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+}
+
+function markClaimProcessing(claim, message) {
+  const statusFilter = $('claim-status-filter');
+  if (statusFilter && statusFilter.value !== 'all') statusFilter.value = 'all';
+  claim._processing = true;
+  claim.verdict = 'pending';
+  claim.verdictDetails = message;
+  renderClaimsList();
+  scrollToClaimCard(claim.id);
+}
+
+async function runClaimVerifyAndRefresh(claim) {
+  markClaimProcessing(claim, 'AI analyzing bill…');
+  try {
+    await verifyClaimWithAI(claim);
+    if (!USE_BACKEND) {
+      mergeAiVerdict(claim);
+      runClientExpenseValidation(claim);
+    }
+  } catch (err) {
+    console.warn('Bill verify:', err);
+    claim.aiError = err.message || String(err);
+    if (claim.verdict === 'pending') claim.verdict = 'review';
+    if (!claim.verdictDetails) {
+      claim.verdictDetails = `Bill verification failed: ${claim.aiError}`;
+    }
+  } finally {
+    claim._processing = false;
+    renderClaimsList();
+    renderExpenseValidationStats();
+  }
+}
+
+function shouldVerifyBillForClaim(claim) {
+  return isBillAiVerifiableClient(claim);
+}
+
 // Render the claims list
 function renderClaimsList() {
   const list = $('claims-list');
@@ -5921,9 +6028,13 @@ function renderClaimsList() {
       ? `<span class="cluster-pill cluster-west">TA · ${escapeHtml(c.subcategoryLabel)}</span>`
       : `<span class="cluster-pill cluster-rapt">DA · ${escapeHtml(c.subcategoryLabel)}</span>`;
     const dateStr = new Date(c.date).toLocaleDateString('en-IN', { day:'numeric', month:'short', year:'numeric' });
+    const isProcessing = !!(c._processing || c.verdict === 'pending');
+    const processingLabel = c.verdictDetails && c.verdict === 'pending'
+      ? c.verdictDetails
+      : (c._processing ? 'Processing…' : 'AI analyzing bill…');
 
     return `
-      <div class="claim-card">
+      <div class="claim-card${isProcessing ? ' is-processing' : ''}" id="claim-card-${c.id}">
         <div class="claim-thumb ${isImage ? '' : 'no-img'}" ${isImage ? `style="background-image:url('${c.billDataUrl}')"` : ''} title="${billKind}">
           ${isImage ? '' : `<span style="font-size:10px;font-weight:600;text-transform:uppercase;color:var(--text-dim)">${isPdf ? 'PDF' : isExcel ? 'Excel' : 'Bill'}</span>`}
         </div>
@@ -5964,6 +6075,12 @@ function renderClaimsList() {
           ${c.validation?.flags?.length ? `
             <div style="margin-top:8px">
               ${c.validation.flags.map(f => `<span class="val-flag-pill ${f.severity === 'collusion' || f.severity === 'suspicious' ? 'critical' : 'warn'}">${escapeHtml(f.code.replace(/_/g, ' '))}</span>`).join('')}
+            </div>
+          ` : ''}
+          ${isProcessing ? `
+            <div class="claim-processing-banner">
+              <span class="ai-spinner"></span>
+              <span>${escapeHtml(processingLabel)}</span>
             </div>
           ` : ''}
           <div class="claim-verdict ${c.verdict}">
@@ -6024,24 +6141,9 @@ async function reverifyClaim(claimId) {
     return;
   }
   claim.aiError = null;
-  claim.verdict = 'pending';
-  claim.verdictDetails = null;
   claim.concerns = [];
   if (!USE_BACKEND) applyRuleChecks(claim);
-  renderClaimsList();
-  try {
-    if (USE_BACKEND) {
-      await verifyClaimWithAI(claim);
-    } else {
-      await verifyClaimWithAI(claim);
-      mergeAiVerdict(claim);
-    }
-  } catch (err) {
-    claim.aiError = err.message || String(err);
-    claim.verdict = 'review';
-  }
-  renderClaimsList();
-  renderExpenseValidationStats();
+  await runClaimVerifyAndRefresh(claim);
 }
 
 // Wire up claims filters
