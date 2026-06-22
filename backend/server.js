@@ -413,7 +413,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.06.30-main',
+    build: '2026.06.31-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -1069,6 +1069,9 @@ app.get('/api/pjp-notices/respond/:token', async (req, res) => {
   try {
     const notice = await getNoticeByToken(req.params.token);
     if (!notice) return res.status(404).json({ error: 'Notice not found' });
+    if (notice.expired) {
+      return res.status(410).json({ error: 'This notice has expired.', notice });
+    }
     res.json({ notice });
   } catch (err) {
     console.error(err);

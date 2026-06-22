@@ -19,23 +19,36 @@ function formatDeviationDate(isoDate) {
   }
 }
 
+function generateResponseLink(token, baseUrl) {
+  return `${baseUrl}/respond/${token}`;
+}
+
 function buildDeviationMessage(notice, baseUrl) {
-  const respondUrl = `${baseUrl}/respond/${notice.responseToken}`;
+  const respondUrl = generateResponseLink(notice.responseToken, baseUrl);
+  const distributor =
+    notice.distributorName || notice.plannedTown || '—';
   const dist =
-    notice.distPjpKm != null ? `${Number(notice.distPjpKm).toFixed(1)} km from planned town` : 'off-plan GPS';
+    notice.distPjpKm != null
+      ? `${Number(notice.distPjpKm).toFixed(1)} km from planned beat`
+      : 'off-plan GPS';
+
   const lines = [
-    '🚨 *PJP deviation — action required*',
+    '🚨 *PJP Deviation Notice*',
     '',
-    `*Auditor:* ${notice.auditorName} (${notice.auditorCode})`,
-    `*Date:* ${formatDeviationDate(notice.deviationDate)}`,
-    `*PJP planned (Col H):* ${notice.plannedTown || '—'}`,
-    `*Current location:* ${notice.currentLocation || '—'}`,
-    `*Distance:* ${dist}`,
+    `Auditor: *${notice.auditorName}* (${notice.auditorCode})`,
+    `Date: *${formatDeviationDate(notice.deviationDate)}*`,
+    `Distributor / beat: *${distributor}*`,
+    `Planned town (Col H): ${notice.plannedTown || '—'}`,
+    `Current location: ${notice.currentLocation || '—'}`,
+    `Distance: ${dist}`,
     '',
-    `@${notice.auditorName} — please share *why you did not follow today's PJP*:`,
-    respondUrl,
+    '❌ *This beat was not followed as per PJP.*',
     '',
-    '_Reply via the link above (opens a short form). Your answer will appear on the Sales Audit dashboard._',
+    `@${notice.auditorName} — please explain the reason by clicking the link below:`,
+    `🔗 ${respondUrl}`,
+    '',
+    '⏳ This notice will expire in 7 days.',
+    '_Your answer will appear on the Sales Audit dashboard._',
   ];
   return lines.join('\n');
 }
@@ -75,30 +88,37 @@ async function sendWhatsAppViaTwilio({ to, message }) {
   return { sent: true, method: 'twilio', sid: data.sid };
 }
 
+/** Alias matching setup guide naming. */
+async function sendViaTwilio(message) {
+  const to = process.env.WHATSAPP_NOTIFY_TO;
+  if (!to) return null;
+  const targets = String(to)
+    .split(',')
+    .map((t) => t.trim())
+    .filter(Boolean);
+  for (const target of targets) {
+    const result = await sendWhatsAppViaTwilio({ to: target, message });
+    if (result.sent) return result;
+  }
+  return null;
+}
+
 async function notifyPjpDeviation(notice, req) {
   const baseUrl = getPublicBaseUrl(req);
   const message = buildDeviationMessage(notice, baseUrl);
   const shareUrl = buildWhatsAppShareUrl(message);
-
-  const notifyTo = process.env.WHATSAPP_NOTIFY_TO;
-  let auto = { sent: false, method: 'manual' };
-  if (notifyTo) {
-    const targets = String(notifyTo)
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-    for (const to of targets) {
-      auto = await sendWhatsAppViaTwilio({ to, message });
-      if (auto.sent) break;
-    }
-  }
+  const auto = (await sendViaTwilio(message)) || { sent: false, method: 'manual' };
 
   return {
+    token: notice.responseToken,
     message,
     shareUrl,
-    respondUrl: `${baseUrl}/respond/${notice.responseToken}`,
+    waMeLink: shareUrl,
+    respondUrl: generateResponseLink(notice.responseToken, baseUrl),
+    responseLink: generateResponseLink(notice.responseToken, baseUrl),
     autoSent: !!auto.sent,
     delivery: auto.sent ? auto.method : 'manual_share',
+    groupNumber: process.env.WHATSAPP_NOTIFY_TO || '',
     error: auto.error || null,
   };
 }
@@ -114,8 +134,10 @@ function isWhatsAppConfigured() {
 
 module.exports = {
   getPublicBaseUrl,
+  generateResponseLink,
   buildDeviationMessage,
   buildWhatsAppShareUrl,
   notifyPjpDeviation,
+  sendViaTwilio,
   isWhatsAppConfigured,
 };

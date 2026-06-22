@@ -1730,7 +1730,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.30';
+const SENTINEL_BUILD = '2026.06.31';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -3164,6 +3164,8 @@ async function notifyPjpDeviationForRow(row) {
     cluster: row.cluster && row.cluster !== '—' ? row.cluster : null,
     deviationDate: STATE.filteredDate,
     plannedTown: row.plannedTown && row.plannedTown !== '—' ? row.plannedTown : null,
+    distributorName:
+      row.distributorName && row.distributorName !== '—' ? row.distributorName : null,
     currentLocation:
       row.currentName && row.currentName !== '—' && row.currentName !== 'No submission'
         ? row.currentName
@@ -3431,6 +3433,12 @@ function buildUnifiedAuditorTableRows() {
 
     const plannedTown = plan?.toTown || '—';
     const workType = plan?.workType || '—';
+    const distributorName =
+      plan?.plannedRsName ||
+      att?.distributorName ||
+      att?.newDistributorName ||
+      att?.beat ||
+      null;
     const { followed, distToPlan } = evaluatePjpFollowed(att, plan);
 
     let status = 'No submission';
@@ -3449,6 +3457,7 @@ function buildUnifiedAuditorTableRows() {
       asm: att?.asm || plan?.asm || '—',
       totalShops: att?.totalShops || 0,
       plannedTown,
+      distributorName,
       workType,
       followed,
       distToPlan,

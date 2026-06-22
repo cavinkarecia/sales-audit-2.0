@@ -5,6 +5,13 @@ function noticeKey(auditorCode, deviationDate) {
   return `${String(auditorCode).trim()}|${String(deviationDate).slice(0, 10)}`;
 }
 
+const NOTICE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function isNoticeExpired(notice) {
+  if (!notice?.expiresAt) return false;
+  return new Date(notice.expiresAt).getTime() <= Date.now();
+}
+
 async function listNoticesForSession(sessionId, deviationDate) {
   const pool = getPool();
   let q = `SELECT * FROM pjp_deviation_notices WHERE session_id = $1`;
@@ -23,7 +30,11 @@ async function getNoticeByToken(token) {
     'SELECT * FROM pjp_deviation_notices WHERE response_token = $1',
     [token]
   );
-  return rows[0] ? serializeNotice(rows[0]) : null;
+  const notice = rows[0] ? serializeNotice(rows[0]) : null;
+  if (notice && isNoticeExpired(notice) && notice.status !== 'responded') {
+    return { ...notice, expired: true };
+  }
+  return notice;
 }
 
 async function createOrRefreshNotice(sessionId, payload) {
@@ -44,7 +55,8 @@ async function createOrRefreshNotice(sessionId, payload) {
   }
 
   const id = existing.rows[0]?.id || `PN-${Date.now().toString(36).toUpperCase()}`;
-  const responseToken = existing.rows[0]?.response_token || crypto.randomBytes(18).toString('hex');
+  const responseToken = existing.rows[0]?.response_token || crypto.randomBytes(32).toString('hex');
+  const expiresAt = new Date(Date.now() + NOTICE_TTL_MS).toISOString();
 
   const fields = {
     id,
@@ -55,29 +67,33 @@ async function createOrRefreshNotice(sessionId, payload) {
     cluster: payload.cluster || null,
     deviation_date: deviationDate,
     planned_town: payload.plannedTown || null,
+    distributor_name: payload.distributorName || null,
     current_location: payload.currentLocation || null,
     dist_pjp_km: payload.distPjpKm != null ? Number(payload.distPjpKm) : null,
     followed_label: payload.followedLabel || 'No',
-    status: 'pending_response',
+    status: 'pending',
     reason_text: existing.rows[0]?.reason_text || null,
     responded_at: existing.rows[0]?.responded_at || null,
+    expires_at: expiresAt,
   };
 
   await pool.query(
     `INSERT INTO pjp_deviation_notices (
       id, session_id, response_token, auditor_code, auditor_name, cluster,
-      deviation_date, planned_town, current_location, dist_pjp_km, followed_label,
-      status, reason_text, responded_at, updated_at
+      deviation_date, planned_town, distributor_name, current_location, dist_pjp_km, followed_label,
+      status, reason_text, responded_at, expires_at, updated_at
     ) VALUES (
-      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW()
+      $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, NOW()
     )
     ON CONFLICT (id) DO UPDATE SET
       auditor_name = EXCLUDED.auditor_name,
       cluster = EXCLUDED.cluster,
       planned_town = EXCLUDED.planned_town,
+      distributor_name = EXCLUDED.distributor_name,
       current_location = EXCLUDED.current_location,
       dist_pjp_km = EXCLUDED.dist_pjp_km,
       followed_label = EXCLUDED.followed_label,
+      expires_at = EXCLUDED.expires_at,
       status = CASE
         WHEN pjp_deviation_notices.status = 'responded' THEN pjp_deviation_notices.status
         ELSE EXCLUDED.status
@@ -92,12 +108,14 @@ async function createOrRefreshNotice(sessionId, payload) {
       fields.cluster,
       fields.deviation_date,
       fields.planned_town,
+      fields.distributor_name,
       fields.current_location,
       fields.dist_pjp_km,
       fields.followed_label,
       fields.status,
       fields.reason_text,
       fields.responded_at,
+      fields.expires_at,
     ]
   );
 
@@ -110,6 +128,11 @@ async function saveNoticeResponse(token, reasonText) {
   if (!text || text.length < 5) {
     throw new Error('Please enter a reason (at least 5 characters).');
   }
+  const existing = await getNoticeByToken(token);
+  if (!existing) throw new Error('Notice not found or link expired.');
+  if (existing.expired) throw new Error('This notice has expired. Ask your manager to send a new WhatsApp notification.');
+  if (existing.status === 'responded') return existing;
+
   const { rows } = await getPool().query(
     `UPDATE pjp_deviation_notices
      SET reason_text = $2, status = 'responded', responded_at = NOW(), updated_at = NOW()
@@ -118,8 +141,6 @@ async function saveNoticeResponse(token, reasonText) {
     [token, text.slice(0, 2000)]
   );
   if (!rows.length) {
-    const existing = await getNoticeByToken(token);
-    if (existing?.status === 'responded') return existing;
     throw new Error('Notice not found or link expired.');
   }
   return serializeNotice(rows[0]);
@@ -151,6 +172,7 @@ function serializeNotice(row) {
       ? String(row.deviation_date).slice(0, 10)
       : row.deviation_date,
     plannedTown: row.planned_town,
+    distributorName: row.distributor_name,
     currentLocation: row.current_location,
     distPjpKm: row.dist_pjp_km != null ? Number(row.dist_pjp_km) : null,
     followedLabel: row.followed_label,
@@ -159,6 +181,7 @@ function serializeNotice(row) {
     whatsappSentAt: row.whatsapp_sent_at,
     whatsappDelivery: row.whatsapp_delivery,
     respondedAt: row.responded_at,
+    expiresAt: row.expires_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -166,6 +189,8 @@ function serializeNotice(row) {
 
 module.exports = {
   noticeKey,
+  NOTICE_TTL_MS,
+  isNoticeExpired,
   listNoticesForSession,
   getNoticeByToken,
   createOrRefreshNotice,

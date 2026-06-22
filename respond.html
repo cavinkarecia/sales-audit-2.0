@@ -92,6 +92,10 @@
       <h1>Link not found</h1>
       <p class="err">This response link is invalid or has expired. Ask your manager to send a new WhatsApp notification.</p>
     </div>
+    <div id="expired" class="hidden">
+      <h1>Notice expired</h1>
+      <p class="err">This PJP deviation notice is older than 7 days. Ask your manager to send a new WhatsApp notification from the dashboard.</p>
+    </div>
   </div>
   <script>
     const token = location.pathname.split('/').filter(Boolean).pop();
@@ -99,13 +103,14 @@
     const formWrap = document.getElementById('form-wrap');
     const done = document.getElementById('done');
     const invalid = document.getElementById('invalid');
+    const expired = document.getElementById('expired');
     const meta = document.getElementById('meta');
     const reasonEl = document.getElementById('reason');
     const errEl = document.getElementById('error');
     const submitBtn = document.getElementById('submit-btn');
 
     function show(el) {
-      [loading, formWrap, done, invalid].forEach((n) => n.classList.add('hidden'));
+      [loading, formWrap, done, invalid, expired].forEach((n) => n.classList.add('hidden'));
       el.classList.remove('hidden');
     }
 
@@ -113,6 +118,10 @@
       try {
         const resp = await fetch(`/api/pjp-notices/respond/${encodeURIComponent(token)}`);
         const data = await resp.json();
+        if (resp.status === 410) {
+          show(expired);
+          return;
+        }
         if (!resp.ok) {
           show(invalid);
           return;
@@ -124,9 +133,11 @@
         }
         const n = data.notice;
         const dateStr = new Date(n.deviationDate + 'T12:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+        const distributor = n.distributorName || n.plannedTown || '—';
         meta.innerHTML = `
           <div><strong>Auditor:</strong> ${escapeHtml(n.auditorName)} (${escapeHtml(n.auditorCode)})</div>
           <div><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
+          <div><strong>Distributor / beat:</strong> ${escapeHtml(distributor)}</div>
           <div><strong>Planned:</strong> ${escapeHtml(n.plannedTown || '—')}</div>
           <div><strong>Your GPS:</strong> ${escapeHtml(n.currentLocation || '—')}</div>
         `;

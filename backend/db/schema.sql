@@ -85,17 +85,22 @@ CREATE TABLE IF NOT EXISTS pjp_deviation_notices (
   cluster TEXT,
   deviation_date DATE NOT NULL,
   planned_town TEXT,
+  distributor_name TEXT,
   current_location TEXT,
   dist_pjp_km NUMERIC,
   followed_label TEXT NOT NULL DEFAULT 'No',
-  status TEXT NOT NULL DEFAULT 'pending_response',
+  status TEXT NOT NULL DEFAULT 'pending',
   reason_text TEXT,
   whatsapp_sent_at TIMESTAMPTZ,
   whatsapp_delivery TEXT,
   responded_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_pjp_notices_session_date ON pjp_deviation_notices(session_id, deviation_date);
 CREATE INDEX IF NOT EXISTS idx_pjp_notices_token ON pjp_deviation_notices(response_token);
+
+ALTER TABLE pjp_deviation_notices ADD COLUMN IF NOT EXISTS distributor_name TEXT;
+ALTER TABLE pjp_deviation_notices ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
