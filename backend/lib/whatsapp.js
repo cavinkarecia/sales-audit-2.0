@@ -123,6 +123,10 @@ async function notifyPjpDeviation(notice, req) {
   };
 }
 
+async function prepareNotification(notice, req) {
+  return notifyPjpDeviation(notice, req);
+}
+
 function isWhatsAppConfigured() {
   return !!(
     process.env.TWILIO_ACCOUNT_SID &&
@@ -138,6 +142,7 @@ module.exports = {
   buildDeviationMessage,
   buildWhatsAppShareUrl,
   notifyPjpDeviation,
+  prepareNotification,
   sendViaTwilio,
   isWhatsAppConfigured,
 };

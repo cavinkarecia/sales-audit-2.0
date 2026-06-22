@@ -319,6 +319,17 @@ html, body {
 .table-sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
 .pjp-notice-cell { max-width: 220px; }
 .pjp-reason-text { font-size: 12px; line-height: 1.45; color: var(--text); }
+.btn.whatsapp-btn {
+  background: rgba(37, 211, 102, 0.12);
+  border-color: rgba(37, 211, 102, 0.35);
+  color: #25d366;
+}
+.btn.whatsapp-btn:hover {
+  background: rgba(37, 211, 102, 0.2);
+  border-color: rgba(37, 211, 102, 0.5);
+}
+.btn.whatsapp-btn:disabled { opacity: 0.6; cursor: wait; }
+.wa-notify-status { font-size: 11px; color: var(--green); margin-top: 4px; }
 .table-empty { padding: 40px; text-align: center; color: var(--text-faint); font-size: 13px; }
 .table-empty svg { width: 36px; height: 36px; margin-bottom: 10px; opacity: 0.4; }
 
@@ -1730,7 +1741,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.07.01';
+const SENTINEL_BUILD = '2026.07.02';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -2255,6 +2266,7 @@ const STATE = {
   whatsappAutoSend: false,
   publicBaseUrl: null,
   pjpNotices: {}, // key: empCode|YYYY-MM-DD → notice from server
+  notifyingPjp: new Set(), // emp codes with notify in flight
 
   // Map state
   map: null,
@@ -3158,39 +3170,55 @@ async function notifyPjpDeviationForRow(row) {
     alert('Select a date first.');
     return;
   }
-  const payload = {
-    auditorCode: row.empCode,
-    auditorName: row.auditorName,
-    cluster: row.cluster && row.cluster !== '—' ? row.cluster : null,
-    deviationDate: STATE.filteredDate,
-    plannedTown: row.plannedTown && row.plannedTown !== '—' ? row.plannedTown : null,
-    distributorName:
-      row.distributorName && row.distributorName !== '—' ? row.distributorName : null,
-    currentLocation:
-      row.currentName && row.currentName !== '—' && row.currentName !== 'No submission'
-        ? row.currentName
-        : null,
-    distPjpKm: row.distToPlan,
-    followedLabel: row.followed,
-  };
+
+  const empKey = normalizeEmpCode(row.empCode);
+  if (STATE.notifyingPjp.has(empKey)) return;
+
+  STATE.notifyingPjp.add(empKey);
+  renderFieldForceTable();
+
+  const distributorName =
+    (row.distributorName && row.distributorName !== '—' ? row.distributorName : null) ||
+    (row.plannedTown && row.plannedTown !== '—' ? row.plannedTown : null);
+
   try {
-    const resp = await apiFetch('/api/pjp-notices', {
+    const resp = await apiFetch('/api/pjp-notify', {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        auditorName: row.auditorName,
+        auditDate: STATE.filteredDate,
+        distributorName,
+        auditorId: row.empCode,
+        plannedTown: row.plannedTown && row.plannedTown !== '—' ? row.plannedTown : null,
+        currentLocation:
+          row.currentName && row.currentName !== '—' && row.currentName !== 'No submission'
+            ? row.currentName
+            : null,
+        distPjpKm: row.distToPlan,
+        cluster: row.cluster && row.cluster !== '—' ? row.cluster : null,
+        followedLabel: row.followed,
+      }),
     });
     const { data } = await parseApiResponse(resp);
-    if (!resp.ok) throw new Error(data.error || 'Could not send notice');
+
+    if (!resp.ok || !data.success) {
+      throw new Error(data.message || data.error || 'Could not send notification');
+    }
+
     if (data.alreadyResponded) {
       alert(data.message || 'Auditor already submitted a reason for this date.');
-    } else if (data.autoSent) {
+    } else if (data.data?.twilioSent && data.data?.twilioSuccess) {
       alert('WhatsApp message sent to the auditors group.');
-    } else if (data.shareUrl) {
-      window.open(data.shareUrl, '_blank', 'noopener');
+    } else if (data.data?.waMeLink) {
+      window.open(data.data.waMeLink, '_blank', 'noopener');
     }
+
     await loadPjpNotices();
-    renderFieldForceTable();
   } catch (e) {
     alert(e.message || 'Could not notify via WhatsApp');
+  } finally {
+    STATE.notifyingPjp.delete(empKey);
+    renderFieldForceTable();
   }
 }
 
@@ -3225,11 +3253,17 @@ function renderPjpNoticeCell(r) {
     }`;
   }
   const sent = !!notice?.whatsappSentAt;
-  const btnLabel = sent ? 'Resend WhatsApp' : 'Notify WhatsApp';
+  const empKey = normalizeEmpCode(r.empCode);
+  const isSending = STATE.notifyingPjp.has(empKey);
+  const btnLabel = isSending
+    ? 'Sending...'
+    : sent
+      ? 'Resend WhatsApp'
+      : 'Notify WhatsApp';
   const statusLine = sent
     ? '<div class="table-sub" style="color:var(--amber)">Awaiting auditor response</div>'
     : '';
-  return `${statusLine}<button type="button" class="btn wa-notify-btn" data-emp="${escapeHtml(r.empCode)}" style="font-size:11px;padding:4px 10px;margin-top:4px">${escapeHtml(btnLabel)}</button>`;
+  return `${statusLine}<button type="button" class="btn whatsapp-btn wa-notify-btn" data-emp="${escapeHtml(r.empCode)}" style="font-size:11px;padding:4px 10px;margin-top:4px" ${isSending ? 'disabled' : ''}>${escapeHtml(btnLabel)}</button>`;
 }
 
 // Look up the planned activity for an auditor on a given date

@@ -155,8 +155,35 @@ async function markWhatsAppSent(noticeId, delivery = 'manual') {
   );
 }
 
+async function getPendingNotices(sessionId, deviationDate) {
+  const notices = await listNoticesForSession(sessionId, deviationDate);
+  return notices.filter((n) => n.status !== 'responded' && !isNoticeExpired(n));
+}
+
+async function getRespondedNotices(sessionId, deviationDate) {
+  const notices = await listNoticesForSession(sessionId, deviationDate);
+  return notices.filter((n) => n.status === 'responded');
+}
+
+/** Guide-compatible alias */
+const respondToNotice = saveNoticeResponse;
+
 async function deleteNoticesForSession(sessionId) {
   await getPool().query('DELETE FROM pjp_deviation_notices WHERE session_id = $1', [sessionId]);
+}
+
+function noticeToGuide(notice) {
+  if (!notice) return null;
+  return {
+    token: notice.responseToken,
+    auditorName: notice.auditorName,
+    auditorCode: notice.auditorCode,
+    auditDate: notice.deviationDate,
+    distributorName: notice.distributorName || notice.plannedTown || null,
+    status: notice.status === 'responded' ? 'responded' : 'pending',
+    reason: notice.reasonText || null,
+    respondedAt: notice.respondedAt || null,
+  };
 }
 
 function serializeNotice(row) {
@@ -192,10 +219,15 @@ module.exports = {
   NOTICE_TTL_MS,
   isNoticeExpired,
   listNoticesForSession,
+  getPendingNotices,
+  getRespondedNotices,
   getNoticeByToken,
   createOrRefreshNotice,
+  createNotice: createOrRefreshNotice,
   saveNoticeResponse,
+  respondToNotice,
   markWhatsAppSent,
   deleteNoticesForSession,
   serializeNotice,
+  noticeToGuide,
 };

@@ -42,13 +42,22 @@ const {
 const { loadExpenseRegistry, deleteRegistryEntry } = require('./lib/expense-validation');
 const {
   listNoticesForSession,
+  getPendingNotices,
+  getRespondedNotices,
   getNoticeByToken,
   createOrRefreshNotice,
   saveNoticeResponse,
   markWhatsAppSent,
   deleteNoticesForSession,
+  noticeToGuide,
 } = require('./lib/pjp-notices');
-const { notifyPjpDeviation, isWhatsAppConfigured, getPublicBaseUrl } = require('./lib/whatsapp');
+const {
+  notifyPjpDeviation,
+  prepareNotification,
+  sendViaTwilio,
+  isWhatsAppConfigured,
+  getPublicBaseUrl,
+} = require('./lib/whatsapp');
 
 const PORT = process.env.PORT || 3000;
 const ROOT_DIR = path.join(__dirname, '..');
@@ -414,7 +423,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.07.01-main',
+    build: '2026.07.02-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -1021,18 +1030,7 @@ app.get('/api/auditors', authRequired, (_req, res) => {
 // --- PJP deviation WhatsApp notices ---
 
 function noticeForGuide(notice) {
-  if (!notice) return null;
-  const status = notice.status === 'responded' ? 'responded' : 'pending';
-  return {
-    token: notice.responseToken,
-    auditorName: notice.auditorName,
-    auditorCode: notice.auditorCode,
-    auditDate: notice.deviationDate,
-    distributorName: notice.distributorName || notice.plannedTown || null,
-    status,
-    reason: notice.reasonText || null,
-    respondedAt: notice.respondedAt || null,
-  };
+  return noticeToGuide(notice);
 }
 
 app.get('/api/pjp-notice/:token', async (req, res) => {
@@ -1058,11 +1056,116 @@ app.get('/api/pjp-notice/:token', async (req, res) => {
 app.post('/api/pjp-notice/:token/respond', async (req, res) => {
   try {
     const reasonText = req.body?.reasonText ?? req.body?.reason;
+    if (!reasonText || !String(reasonText).trim()) {
+      return res.status(400).json({ success: false, message: 'Reason is required.' });
+    }
     const notice = await saveNoticeResponse(req.params.token, reasonText);
-    res.json({ success: true, notice: noticeForGuide(notice) });
+    res.json({
+      success: true,
+      message: 'Response recorded successfully.',
+      notice: noticeForGuide(notice),
+    });
   } catch (err) {
     console.error(err);
     res.status(400).json({ success: false, message: err.message || 'Could not save response' });
+  }
+});
+
+app.get('/api/pjp-notices/pending', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ success: false, message: 'Missing X-Session-Id header' });
+    const date = req.query.date ? String(req.query.date).slice(0, 10) : null;
+    const notices = await getPendingNotices(sessionId, date);
+    res.json({ success: true, notices: notices.map(noticeForGuide) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: err.message || 'Could not load pending notices' });
+  }
+});
+
+app.get('/api/pjp-notices/responded', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ success: false, message: 'Missing X-Session-Id header' });
+    const date = req.query.date ? String(req.query.date).slice(0, 10) : null;
+    const notices = await getRespondedNotices(sessionId, date);
+    res.json({ success: true, notices: notices.map(noticeForGuide) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: err.message || 'Could not load responded notices' });
+  }
+});
+
+app.post('/api/pjp-notify', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ success: false, message: 'Missing X-Session-Id header' });
+
+    const body = req.body || {};
+    const auditorName = body.auditorName;
+    const auditDate = body.auditDate || body.deviationDate;
+    const auditorId = body.auditorId || body.auditorCode;
+
+    if (!auditorName || !auditDate) {
+      return res.status(400).json({
+        success: false,
+        message: 'Auditor name and audit date are required.',
+      });
+    }
+    if (!auditorId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Auditor id (employee code) is required.',
+      });
+    }
+
+    const noticePayload = {
+      auditorCode: auditorId,
+      auditorName,
+      deviationDate: auditDate,
+      distributorName: body.distributorName || null,
+      plannedTown: body.plannedTown || null,
+      currentLocation: body.currentLocation || null,
+      distPjpKm: body.distPjpKm != null ? Number(body.distPjpKm) : null,
+      cluster: body.cluster || null,
+      followedLabel: body.followedLabel || 'No',
+    };
+
+    const { notice, alreadyResponded } = await createOrRefreshNotice(sessionId, noticePayload);
+    if (alreadyResponded) {
+      return res.json({
+        success: true,
+        message: 'Auditor already submitted a reason for this date.',
+        alreadyResponded: true,
+        data: { notice: noticeForGuide(notice) },
+      });
+    }
+
+    const notification = await prepareNotification(notice, req);
+    await markWhatsAppSent(notice.id, notification.autoSent ? notification.delivery : 'manual_share');
+
+    let twilioResult = null;
+    if (process.env.TWILIO_ACCOUNT_SID) {
+      twilioResult = notification.autoSent ? notification : await sendViaTwilio(notification.message);
+    }
+
+    res.json({
+      success: true,
+      message: 'Notification prepared.',
+      data: {
+        token: notification.token,
+        waMeLink: notification.waMeLink,
+        message: notification.message,
+        responseLink: notification.responseLink,
+        twilioSent: !!twilioResult,
+        twilioSuccess: !!(twilioResult && (twilioResult.sent || twilioResult.sid)),
+        notice: noticeForGuide(await getNoticeByToken(notice.responseToken)),
+      },
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: err.message || 'Could not send notification' });
   }
 });
 
