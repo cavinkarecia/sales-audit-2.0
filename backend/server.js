@@ -1,6 +1,7 @@
 require('dotenv').config();
 
 const path = require('path');
+const fs = require('fs');
 const crypto = require('crypto');
 const express = require('express');
 const compression = require('compression');
@@ -413,7 +414,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.06.31-main',
+    build: '2026.07.01-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -1019,6 +1020,52 @@ app.get('/api/auditors', authRequired, (_req, res) => {
 
 // --- PJP deviation WhatsApp notices ---
 
+function noticeForGuide(notice) {
+  if (!notice) return null;
+  const status = notice.status === 'responded' ? 'responded' : 'pending';
+  return {
+    token: notice.responseToken,
+    auditorName: notice.auditorName,
+    auditorCode: notice.auditorCode,
+    auditDate: notice.deviationDate,
+    distributorName: notice.distributorName || notice.plannedTown || null,
+    status,
+    reason: notice.reasonText || null,
+    respondedAt: notice.respondedAt || null,
+  };
+}
+
+app.get('/api/pjp-notice/:token', async (req, res) => {
+  try {
+    const notice = await getNoticeByToken(req.params.token);
+    if (!notice) {
+      return res.status(404).json({ success: false, message: 'Notice not found' });
+    }
+    if (notice.expired) {
+      return res.status(410).json({
+        success: false,
+        message: 'This notice has expired.',
+        notice: noticeForGuide(notice),
+      });
+    }
+    res.json({ success: true, notice: noticeForGuide(notice) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: err.message || 'Could not load notice' });
+  }
+});
+
+app.post('/api/pjp-notice/:token/respond', async (req, res) => {
+  try {
+    const reasonText = req.body?.reasonText ?? req.body?.reason;
+    const notice = await saveNoticeResponse(req.params.token, reasonText);
+    res.json({ success: true, notice: noticeForGuide(notice) });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ success: false, message: err.message || 'Could not save response' });
+  }
+});
+
 app.get('/api/pjp-notices', authRequired, async (req, res) => {
   try {
     const sessionId = getSessionId(req);
@@ -1081,7 +1128,7 @@ app.get('/api/pjp-notices/respond/:token', async (req, res) => {
 
 app.post('/api/pjp-notices/respond/:token', async (req, res) => {
   try {
-    const reasonText = req.body?.reasonText;
+    const reasonText = req.body?.reasonText ?? req.body?.reason;
     const notice = await saveNoticeResponse(req.params.token, reasonText);
     res.json({ ok: true, notice });
   } catch (err) {
@@ -1093,7 +1140,9 @@ app.post('/api/pjp-notices/respond/:token', async (req, res) => {
 // --- Static frontend (same Render URL) ---
 
 app.get('/respond/:token', (_req, res) => {
-  res.sendFile(path.join(ROOT_DIR, 'respond.html'));
+  const publicPage = path.join(ROOT_DIR, 'public', 'respond.html');
+  const legacyPage = path.join(ROOT_DIR, 'respond.html');
+  res.sendFile(fs.existsSync(publicPage) ? publicPage : legacyPage);
 });
 
 app.use(express.static(ROOT_DIR, { index: false }));
