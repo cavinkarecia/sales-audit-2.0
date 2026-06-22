@@ -39,6 +39,15 @@ const {
   serializeBulkPdfJob,
 } = require('./lib/bulk-jobs');
 const { loadExpenseRegistry, deleteRegistryEntry } = require('./lib/expense-validation');
+const {
+  listNoticesForSession,
+  getNoticeByToken,
+  createOrRefreshNotice,
+  saveNoticeResponse,
+  markWhatsAppSent,
+  deleteNoticesForSession,
+} = require('./lib/pjp-notices');
+const { notifyPjpDeviation, isWhatsAppConfigured, getPublicBaseUrl } = require('./lib/whatsapp');
 
 const PORT = process.env.PORT || 3000;
 const ROOT_DIR = path.join(__dirname, '..');
@@ -404,7 +413,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.06.29-main',
+    build: '2026.06.30-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -415,6 +424,8 @@ app.get('/api/config', (_req, res) => {
     authRequired: false,
     aiKeySource: process.env.ANTHROPIC_API_KEY ? 'server' : 'browser',
     hasServerApiKey: !!process.env.ANTHROPIC_API_KEY,
+    whatsappAutoSend: isWhatsAppConfigured(),
+    publicBaseUrl: process.env.PUBLIC_BASE_URL || null,
   });
 });
 
@@ -573,6 +584,7 @@ app.delete('/api/state', authRequired, async (req, res) => {
     await pool.query('DELETE FROM claims WHERE session_id = $1', [sessionId]);
     await pool.query('DELETE FROM attendance_snapshots WHERE session_id = $1', [sessionId]);
     await pool.query('DELETE FROM pjp_snapshots WHERE session_id = $1', [sessionId]);
+    await deleteNoticesForSession(sessionId);
     res.json({ ok: true });
   } catch (err) {
     console.error(err);
@@ -1005,7 +1017,81 @@ app.get('/api/auditors', authRequired, (_req, res) => {
   res.json({ auditors: AUDITOR_MASTER });
 });
 
+// --- PJP deviation WhatsApp notices ---
+
+app.get('/api/pjp-notices', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const date = req.query.date ? String(req.query.date).slice(0, 10) : null;
+    const notices = await listNoticesForSession(sessionId, date);
+    res.json({ notices });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Could not load PJP notices' });
+  }
+});
+
+app.post('/api/pjp-notices', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const body = req.body || {};
+    if (!body.auditorCode || !body.deviationDate) {
+      return res.status(400).json({ error: 'auditorCode and deviationDate are required.' });
+    }
+
+    const { notice, alreadyResponded } = await createOrRefreshNotice(sessionId, body);
+    if (alreadyResponded) {
+      return res.json({
+        notice,
+        alreadyResponded: true,
+        message: 'Auditor already submitted a reason for this date.',
+      });
+    }
+
+    const delivery = await notifyPjpDeviation(notice, req);
+    await markWhatsAppSent(notice.id, delivery.autoSent ? delivery.delivery : 'manual_share');
+
+    const updated = await getNoticeByToken(notice.responseToken);
+    res.status(201).json({
+      notice: updated,
+      ...delivery,
+      alreadyResponded: false,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Could not create PJP notice' });
+  }
+});
+
+app.get('/api/pjp-notices/respond/:token', async (req, res) => {
+  try {
+    const notice = await getNoticeByToken(req.params.token);
+    if (!notice) return res.status(404).json({ error: 'Notice not found' });
+    res.json({ notice });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Could not load notice' });
+  }
+});
+
+app.post('/api/pjp-notices/respond/:token', async (req, res) => {
+  try {
+    const reasonText = req.body?.reasonText;
+    const notice = await saveNoticeResponse(req.params.token, reasonText);
+    res.json({ ok: true, notice });
+  } catch (err) {
+    console.error(err);
+    res.status(400).json({ error: err.message || 'Could not save response' });
+  }
+});
+
 // --- Static frontend (same Render URL) ---
+
+app.get('/respond/:token', (_req, res) => {
+  res.sendFile(path.join(ROOT_DIR, 'respond.html'));
+});
 
 app.use(express.static(ROOT_DIR, { index: false }));
 
@@ -1014,7 +1100,7 @@ app.get('/', (_req, res) => {
 });
 
 app.get('*', (req, res, next) => {
-  if (req.path.startsWith('/api/')) return next();
+  if (req.path.startsWith('/api/') || req.path.startsWith('/respond/')) return next();
   res.sendFile(path.join(ROOT_DIR, 'index.html'));
 });
 

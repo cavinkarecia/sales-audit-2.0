@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PJP deviation — submit reason</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --border: #2a2f3d;
+      --text: #e8eaef;
+      --dim: #8b93a8;
+      --blue: #3b82f6;
+      --green: #22c55e;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .card {
+      width: 100%;
+      max-width: 480px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    h1 { font-size: 18px; margin: 0 0 6px; }
+    .sub { color: var(--dim); font-size: 13px; margin-bottom: 18px; }
+    .meta { font-size: 13px; line-height: 1.6; margin-bottom: 16px; }
+    .meta strong { color: var(--text); }
+    label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.06em; }
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      background: #12151c;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 14px;
+      font-family: inherit;
+      resize: vertical;
+    }
+    textarea:focus { outline: none; border-color: var(--blue); }
+    button {
+      margin-top: 14px;
+      width: 100%;
+      background: var(--blue);
+      color: white;
+      border: none;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .ok { color: var(--green); font-size: 14px; }
+    .err { color: var(--red); font-size: 13px; margin-top: 10px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="loading">Loading…</div>
+    <div id="form-wrap" class="hidden">
+      <h1>PJP deviation reason</h1>
+      <div class="sub">Your response will appear on the Sales Audit dashboard.</div>
+      <div class="meta" id="meta"></div>
+      <label for="reason">Why were you not at the planned PJP location?</label>
+      <textarea id="reason" placeholder="e.g. Client emergency visit, vehicle breakdown, approved route change…"></textarea>
+      <button id="submit-btn" type="button">Submit reason</button>
+      <div class="err hidden" id="error"></div>
+    </div>
+    <div id="done" class="hidden">
+      <h1>Thank you</h1>
+      <p class="ok">Your reason has been recorded and is visible to your manager on the dashboard.</p>
+      <p class="sub" id="done-summary"></p>
+    </div>
+    <div id="invalid" class="hidden">
+      <h1>Link not found</h1>
+      <p class="err">This response link is invalid or has expired. Ask your manager to send a new WhatsApp notification.</p>
+    </div>
+  </div>
+  <script>
+    const token = location.pathname.split('/').filter(Boolean).pop();
+    const loading = document.getElementById('loading');
+    const formWrap = document.getElementById('form-wrap');
+    const done = document.getElementById('done');
+    const invalid = document.getElementById('invalid');
+    const meta = document.getElementById('meta');
+    const reasonEl = document.getElementById('reason');
+    const errEl = document.getElementById('error');
+    const submitBtn = document.getElementById('submit-btn');
+
+    function show(el) {
+      [loading, formWrap, done, invalid].forEach((n) => n.classList.add('hidden'));
+      el.classList.remove('hidden');
+    }
+
+    async function load() {
+      try {
+        const resp = await fetch(`/api/pjp-notices/respond/${encodeURIComponent(token)}`);
+        const data = await resp.json();
+        if (!resp.ok) {
+          show(invalid);
+          return;
+        }
+        if (data.notice.status === 'responded' && data.notice.reasonText) {
+          document.getElementById('done-summary').textContent = data.notice.reasonText;
+          show(done);
+          return;
+        }
+        const n = data.notice;
+        const dateStr = new Date(n.deviationDate + 'T12:00:00').toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+        meta.innerHTML = `
+          <div><strong>Auditor:</strong> ${escapeHtml(n.auditorName)} (${escapeHtml(n.auditorCode)})</div>
+          <div><strong>Date:</strong> ${escapeHtml(dateStr)}</div>
+          <div><strong>Planned:</strong> ${escapeHtml(n.plannedTown || '—')}</div>
+          <div><strong>Your GPS:</strong> ${escapeHtml(n.currentLocation || '—')}</div>
+        `;
+        show(formWrap);
+      } catch {
+        show(invalid);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    submitBtn.addEventListener('click', async () => {
+      errEl.classList.add('hidden');
+      const reasonText = reasonEl.value.trim();
+      if (reasonText.length < 5) {
+        errEl.textContent = 'Please enter at least 5 characters.';
+        errEl.classList.remove('hidden');
+        return;
+      }
+      submitBtn.disabled = true;
+      try {
+        const resp = await fetch(`/api/pjp-notices/respond/${encodeURIComponent(token)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ reasonText }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || 'Could not save');
+        document.getElementById('done-summary').textContent = data.notice.reasonText;
+        show(done);
+      } catch (e) {
+        errEl.textContent = e.message || 'Could not submit';
+        errEl.classList.remove('hidden');
+        submitBtn.disabled = false;
+      }
+    });
+
+    load();
+  </script>
+</body>
+</html>

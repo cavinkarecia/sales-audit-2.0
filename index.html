@@ -317,6 +317,8 @@ html, body {
 .table tbody tr:last-child td { border-bottom: none; }
 .table-name { font-weight: 600; }
 .table-sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; }
+.pjp-notice-cell { max-width: 220px; }
+.pjp-reason-text { font-size: 12px; line-height: 1.45; color: var(--text); }
 .table-empty { padding: 40px; text-align: center; color: var(--text-faint); font-size: 13px; }
 .table-empty svg { width: 36px; height: 36px; margin-bottom: 10px; opacity: 0.4; }
 
@@ -1168,6 +1170,7 @@ html, body {
                   <th>Status</th>
                   <th>PJP planned (Col H)</th>
                   <th>Followed PJP?</th>
+                  <th>Reason / Notify</th>
                   <th>Dist PJP (km)</th>
                   <th>Next location</th>
                   <th>Travel days</th>
@@ -1727,7 +1730,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.29';
+const SENTINEL_BUILD = '2026.06.30';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -2039,9 +2042,12 @@ async function bootstrapBackend() {
     const { data: cfg } = await parseApiResponse(cfgResp);
     BACKEND_AUTH_REQUIRED = false;
     STATE.hasServerApiKey = !!cfg.hasServerApiKey;
+    STATE.whatsappAutoSend = !!cfg.whatsappAutoSend;
+    STATE.publicBaseUrl = cfg.publicBaseUrl || null;
     showLoginGate(false);
     updateApiKeyChip();
     await loadStateFromBackend();
+    startPjpNoticePolling();
   } catch (err) {
     console.warn('Backend bootstrap:', err);
     alert(
@@ -2246,6 +2252,9 @@ const STATE = {
   claims: [],
   claudeApiKey: '',  // Saved in localStorage or sent from browser header
   hasServerApiKey: false,  // true when ANTHROPIC_API_KEY is set on Render
+  whatsappAutoSend: false,
+  publicBaseUrl: null,
+  pjpNotices: {}, // key: empCode|YYYY-MM-DD → notice from server
 
   // Map state
   map: null,
@@ -3094,19 +3103,131 @@ function refreshDashboard() {
   }
   STATE.dateFiltered = rowsOnDate.map(hydrateAttendanceRow);
   computeKPIs();
-  renderFieldForceTable();
-  renderMap();
-  renderMapPjpPanel();
-  renderUnmatchedPanel();
-  requestAnimationFrame(() => {
-    setTimeout(() => {
-      if (STATE.map) {
-        STATE.map.invalidateSize();
-        renderMap();
-      }
-    }, 120);
+  const noticesPromise =
+    USE_BACKEND && STATE.filteredDate ? loadPjpNotices() : Promise.resolve();
+  noticesPromise.finally(() => {
+    renderFieldForceTable();
+    renderMap();
+    renderMapPjpPanel();
+    renderUnmatchedPanel();
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        if (STATE.map) {
+          STATE.map.invalidateSize();
+          renderMap();
+        }
+      }, 120);
+    });
+    if (STATE.currentView === 'expense') renderExpenseView();
   });
-  if (STATE.currentView === 'expense') renderExpenseView();
+}
+
+function pjpNoticeKey(empCode, deviationDate) {
+  return `${normalizeEmpCode(empCode)}|${String(deviationDate).slice(0, 10)}`;
+}
+
+function getPjpNoticeForRow(empCode, dKey) {
+  return STATE.pjpNotices?.[pjpNoticeKey(empCode, dKey)] || null;
+}
+
+async function loadPjpNotices() {
+  if (!USE_BACKEND || !STATE.filteredDate) return;
+  try {
+    const resp = await apiFetch(
+      `/api/pjp-notices?date=${encodeURIComponent(STATE.filteredDate)}`
+    );
+    const { data } = await parseApiResponse(resp);
+    if (!resp.ok) return;
+    const map = {};
+    (data.notices || []).forEach((n) => {
+      const dk = String(n.deviationDate).slice(0, 10);
+      map[pjpNoticeKey(n.auditorCode, dk)] = n;
+    });
+    STATE.pjpNotices = map;
+  } catch (e) {
+    console.warn('PJP notices:', e);
+  }
+}
+
+async function notifyPjpDeviationForRow(row) {
+  if (!USE_BACKEND) {
+    alert('WhatsApp notifications require the hosted app (open from your Render URL).');
+    return;
+  }
+  if (!STATE.filteredDate) {
+    alert('Select a date first.');
+    return;
+  }
+  const payload = {
+    auditorCode: row.empCode,
+    auditorName: row.auditorName,
+    cluster: row.cluster && row.cluster !== '—' ? row.cluster : null,
+    deviationDate: STATE.filteredDate,
+    plannedTown: row.plannedTown && row.plannedTown !== '—' ? row.plannedTown : null,
+    currentLocation:
+      row.currentName && row.currentName !== '—' && row.currentName !== 'No submission'
+        ? row.currentName
+        : null,
+    distPjpKm: row.distToPlan,
+    followedLabel: row.followed,
+  };
+  try {
+    const resp = await apiFetch('/api/pjp-notices', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    const { data } = await parseApiResponse(resp);
+    if (!resp.ok) throw new Error(data.error || 'Could not send notice');
+    if (data.alreadyResponded) {
+      alert(data.message || 'Auditor already submitted a reason for this date.');
+    } else if (data.autoSent) {
+      alert('WhatsApp message sent to the auditors group.');
+    } else if (data.shareUrl) {
+      window.open(data.shareUrl, '_blank', 'noopener');
+    }
+    await loadPjpNotices();
+    renderFieldForceTable();
+  } catch (e) {
+    alert(e.message || 'Could not notify via WhatsApp');
+  }
+}
+
+let pjpNoticePollId = null;
+function startPjpNoticePolling() {
+  if (!USE_BACKEND || pjpNoticePollId) return;
+  pjpNoticePollId = setInterval(async () => {
+    if (STATE.currentView !== 'overview' || !STATE.filteredDate) return;
+    const prev = JSON.stringify(STATE.pjpNotices);
+    await loadPjpNotices();
+    if (JSON.stringify(STATE.pjpNotices) !== prev) renderFieldForceTable();
+  }, 45000);
+}
+
+function renderPjpNoticeCell(r) {
+  if (r.followed !== 'No') return '<span class="text-faint">—</span>';
+  if (!USE_BACKEND) {
+    return '<span class="text-faint" title="Open from Render URL for WhatsApp">Server only</span>';
+  }
+  const notice = getPjpNoticeForRow(r.empCode, STATE.filteredDate);
+  if (notice?.reasonText) {
+    const when = notice.respondedAt
+      ? new Date(notice.respondedAt).toLocaleString('en-IN', {
+          day: 'numeric',
+          month: 'short',
+          hour: '2-digit',
+          minute: '2-digit',
+        })
+      : '';
+    return `<div class="pjp-reason-text">${escapeHtml(notice.reasonText)}</div>${
+      when ? `<div class="table-sub">Responded ${escapeHtml(when)}</div>` : ''
+    }`;
+  }
+  const sent = !!notice?.whatsappSentAt;
+  const btnLabel = sent ? 'Resend WhatsApp' : 'Notify WhatsApp';
+  const statusLine = sent
+    ? '<div class="table-sub" style="color:var(--amber)">Awaiting auditor response</div>'
+    : '';
+  return `${statusLine}<button type="button" class="btn wa-notify-btn" data-emp="${escapeHtml(r.empCode)}" style="font-size:11px;padding:4px 10px;margin-top:4px">${escapeHtml(btnLabel)}</button>`;
 }
 
 // Look up the planned activity for an auditor on a given date
@@ -3380,7 +3501,7 @@ function renderFieldForceTable() {
   const tbody = $('ff-tbody');
   if (!tbody) return;
   if (!filtered.length) {
-    tbody.innerHTML = `<tr><td colspan="14" class="table-empty">No auditors match filters. Upload PJP + attendance and pick a date.</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="15" class="table-empty">No auditors match filters. Upload PJP + attendance and pick a date.</td></tr>`;
     return;
   }
 
@@ -3428,6 +3549,7 @@ function renderFieldForceTable() {
         <td>${statusPill}</td>
         <td><div>${escapeHtml(r.plannedTown)}</div><div class="table-sub">${escapeHtml(r.workType)}</div></td>
         <td><span class="pill ${followCls}">${escapeHtml(r.followed)}</span></td>
+        <td class="pjp-notice-cell">${renderPjpNoticeCell(r)}</td>
         <td style="text-align:right">${distPlan}</td>
         <td>${escapeHtml(r.nextLocation)}</td>
         <td style="text-align:center">${r.travelDaysMonth}</td>
@@ -3445,6 +3567,19 @@ function renderFieldForceTable() {
     el.addEventListener('change', renderFieldForceTable);
   }
 });
+
+const ffTbody = $('ff-tbody');
+if (ffTbody) {
+  ffTbody.addEventListener('click', (e) => {
+    const btn = e.target.closest('.wa-notify-btn');
+    if (!btn) return;
+    const emp = btn.dataset.emp;
+    const row = buildUnifiedAuditorTableRows().find(
+      (r) => normalizeEmpCode(r.empCode) === normalizeEmpCode(emp)
+    );
+    if (row) notifyPjpDeviationForRow(row);
+  });
+}
 
 // =================================================================
 // MAP — PJP Market Visits by auditor (Work Type column)
