@@ -183,6 +183,7 @@ function noticeToGuide(notice) {
     status: notice.status === 'responded' ? 'responded' : 'pending',
     reason: notice.reasonText || null,
     respondedAt: notice.respondedAt || null,
+    whatsappSentAt: notice.whatsappSentAt || null,
   };
 }
 

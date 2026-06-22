@@ -1741,7 +1741,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.07.02';
+const SENTINEL_BUILD = '2026.07.03';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -3161,6 +3161,75 @@ async function loadPjpNotices() {
   }
 }
 
+/** Poll interval for WhatsApp deviation responses (Step 8). */
+const POLL_INTERVAL = 45000;
+
+function normalizeGuideNotice(n) {
+  if (!n) return null;
+  const deviationDate = String(n.auditDate || n.deviationDate || '').slice(0, 10);
+  const auditorCode = n.auditorCode || n.auditorId;
+  if (!auditorCode || !deviationDate) return null;
+  return {
+    responseToken: n.token || n.responseToken,
+    auditorCode,
+    auditorName: n.auditorName,
+    deviationDate,
+    distributorName: n.distributorName,
+    status: n.status === 'responded' ? 'responded' : 'pending',
+    reasonText: n.reason || n.reasonText || null,
+    respondedAt: n.respondedAt || null,
+    whatsappSentAt: n.whatsappSentAt || null,
+  };
+}
+
+/** Merge polled notices into STATE and refresh the auditor table when changed. */
+function updateDashboardTable(notices) {
+  if (!Array.isArray(notices) || !STATE.filteredDate) return false;
+  const activeDate = String(STATE.filteredDate).slice(0, 10);
+  let changed = false;
+
+  for (const raw of notices) {
+    const n = normalizeGuideNotice(raw);
+    if (!n || n.deviationDate !== activeDate) continue;
+    const key = pjpNoticeKey(n.auditorCode, n.deviationDate);
+    const prev = STATE.pjpNotices[key];
+    const merged = { ...(prev || {}), ...n };
+    if (JSON.stringify(prev) !== JSON.stringify(merged)) {
+      STATE.pjpNotices[key] = merged;
+      changed = true;
+    }
+  }
+
+  if (changed && STATE.currentView === 'overview') {
+    renderFieldForceTable();
+  }
+  return changed;
+}
+
+async function pollForResponses() {
+  if (!USE_BACKEND || !STATE.filteredDate) return;
+  if (STATE.currentView !== 'overview') return;
+
+  try {
+    const dateQ = `?date=${encodeURIComponent(STATE.filteredDate)}`;
+    const [respondedResp, pendingResp] = await Promise.all([
+      apiFetch(`/api/pjp-notices/responded${dateQ}`),
+      apiFetch(`/api/pjp-notices/pending${dateQ}`),
+    ]);
+    const { data: respondedData } = await parseApiResponse(respondedResp);
+    const { data: pendingData } = await parseApiResponse(pendingResp);
+
+    if (respondedResp.ok && respondedData.success) {
+      updateDashboardTable(respondedData.notices);
+    }
+    if (pendingResp.ok && pendingData.success) {
+      updateDashboardTable(pendingData.notices);
+    }
+  } catch (err) {
+    console.error('Polling error:', err);
+  }
+}
+
 async function notifyPjpDeviationForRow(row) {
   if (!USE_BACKEND) {
     alert('WhatsApp notifications require the hosted app (open from your Render URL).');
@@ -3225,12 +3294,8 @@ async function notifyPjpDeviationForRow(row) {
 let pjpNoticePollId = null;
 function startPjpNoticePolling() {
   if (!USE_BACKEND || pjpNoticePollId) return;
-  pjpNoticePollId = setInterval(async () => {
-    if (STATE.currentView !== 'overview' || !STATE.filteredDate) return;
-    const prev = JSON.stringify(STATE.pjpNotices);
-    await loadPjpNotices();
-    if (JSON.stringify(STATE.pjpNotices) !== prev) renderFieldForceTable();
-  }, 45000);
+  pollForResponses();
+  pjpNoticePollId = setInterval(pollForResponses, POLL_INTERVAL);
 }
 
 function renderPjpNoticeCell(r) {
@@ -3239,7 +3304,8 @@ function renderPjpNoticeCell(r) {
     return '<span class="text-faint" title="Open from Render URL for WhatsApp">Server only</span>';
   }
   const notice = getPjpNoticeForRow(r.empCode, STATE.filteredDate);
-  if (notice?.reasonText) {
+  if (notice?.reasonText || notice?.reason) {
+    const reason = notice.reasonText || notice.reason;
     const when = notice.respondedAt
       ? new Date(notice.respondedAt).toLocaleString('en-IN', {
           day: 'numeric',
@@ -3248,7 +3314,7 @@ function renderPjpNoticeCell(r) {
           minute: '2-digit',
         })
       : '';
-    return `<div class="pjp-reason-text">${escapeHtml(notice.reasonText)}</div>${
+    return `<div class="pjp-reason-text">${escapeHtml(reason)}</div>${
       when ? `<div class="table-sub">Responded ${escapeHtml(when)}</div>` : ''
     }`;
   }
