@@ -1106,19 +1106,21 @@ html, body {
               <select class="select" id="map-pjp-auditor" style="min-width:220px" disabled>
                 <option value="">All auditors</option>
               </select>
-              <span class="text-dim" style="font-size:12px" id="map-roster-hint">Market Visits (Col H) + GPS on selected date</span>
+              <span class="text-dim" style="font-size:12px" id="map-roster-hint">Full-month PJP (Col H) + today&apos;s GPS for selected auditor</span>
             </div>
             <div class="map-wrap">
               <div id="map"></div>
               <div class="map-legend" id="map-legend-current">
-                <div class="legend-item"><span class="legend-dot dot-on"></span> On field (GPS)</div>
-                <div class="legend-item"><span class="legend-dot dot-absent"></span> Absent (GPS)</div>
+                <div class="legend-item"><span class="legend-dot dot-on"></span> Followed PJP (≤50 km)</div>
+                <div class="legend-item"><span class="legend-dot dot-absent"></span> Did not follow PJP / absent</div>
+                <div class="legend-item"><span class="legend-dot" style="background:#6b7280"></span> No GPS / no submission</div>
                 <div class="legend-item"><span class="legend-dot dot-base"></span> Home base</div>
               </div>
               <div class="map-legend hidden" id="map-legend-roster" style="display:none">
-                <div class="legend-item"><span class="legend-dot dot-plan"></span> Market Visit planned (Col H)</div>
+                <div class="legend-item"><span class="legend-dot dot-plan"></span> PJP planned (Col H)</div>
+                <div class="legend-item"><span class="legend-dot" style="background:#3b82f6"></span> Travel day planned</div>
                 <div class="legend-item"><span class="legend-dot dot-on"></span> Current GPS (selected date)</div>
-                <div class="legend-item"><span class="legend-line" style="border-color:#38bdf8"></span> GPS → audit site (km)</div>
+                <div class="legend-item"><span class="legend-line" style="border-color:#38bdf8"></span> GPS → today&apos;s planned site</div>
               </div>
             </div>
           </div>
@@ -1741,7 +1743,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.07.03';
+const SENTINEL_BUILD = '2026.07.04';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -3860,28 +3862,34 @@ function resolvePlanEmpCode(plan) {
   return '';
 }
 
-/** Market Visit markers for roster map (Col H = toTown). Uses full PJP month by default. */
-function buildRosterMarketVisitMarkers(empCodeFilter = null) {
+/** All planned PJP points (Col H) for roster map — full month when PJP loaded. */
+function buildRosterPlanMarkers(empCodeFilter = null) {
   if (!STATE.planRows.length) return [];
   const range = getRosterVisitDateRange();
   if (!range) return [];
   const { startKey, endKey } = range;
   const todayKey = STATE.filteredDate ? dateKey(new Date(STATE.filteredDate)) : null;
-  const visitIdxByAuditor = {};
+  const offsetIdx = {};
   const out = [];
+
   for (const plan of STATE.planRows) {
-    if (!isMarketVisitWorkType(plan.workType) || !plan.dateKey || !plan.toTown) continue;
+    if (!plan.dateKey || !plan.toTown) continue;
     if (plan.dateKey < startKey || plan.dateKey > endKey) continue;
     if (!planMatchesFocusAuditor(plan, empCodeFilter)) continue;
     const ec = resolvePlanEmpCode(plan);
     if (!ec) continue;
-    const geo = resolveMarketVisitToTownCoords(plan);
+    const geo = resolveCityCoords(plan.toTown);
     if (!geo) continue;
-    const idx = visitIdxByAuditor[ec] || 0;
-    visitIdxByAuditor[ec] = idx + 1;
+
+    const offsetKey = `${ec}|${plan.dateKey}|${plan.toTown}`;
+    const idx = offsetIdx[offsetKey] || 0;
+    offsetIdx[offsetKey] = idx + 1;
     const coords = offsetCoordsForVisitIndex(geo.lat, geo.lng, idx);
     const master = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === ec);
     const d = plan.date ? new Date(plan.date) : new Date(`${plan.dateKey}T12:00:00`);
+    const isMarketVisit = isMarketVisitWorkType(plan.workType);
+    const isTravel = /travel\s*day/i.test(plan.workType || '');
+
     out.push({
       plan,
       coords,
@@ -3891,9 +3899,17 @@ function buildRosterMarketVisitMarkers(empCodeFilter = null) {
       dateKey: plan.dateKey,
       dateLabel: d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
       isToday: todayKey != null && plan.dateKey === todayKey,
+      isMarketVisit,
+      isTravel,
+      workType: plan.workType || '—',
     });
   }
   return out.sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+}
+
+/** Market Visit markers for roster map (Col H = toTown). Uses full PJP month by default. */
+function buildRosterMarketVisitMarkers(empCodeFilter = null) {
+  return buildRosterPlanMarkers(empCodeFilter).filter((v) => v.isMarketVisit);
 }
 
 /** Forward-looking window from a date (used for subtitles). */
@@ -3908,13 +3924,48 @@ function buildUpcomingMarketVisitMarkers(fromDate, days = UPCOMING_PJP_DAYS, emp
   );
 }
 
-/** Section 1: one marker per attendance submission on the selected date (GPS from Location). */
+/** Section 1: all PJP auditors for selected date — GPS + PJP follow status. */
 function buildCurrentLocationEntries() {
   const filter = $('map-filter')?.value || 'all';
+  const dKey = STATE.filteredDate;
+
+  if (STATE.pjpEmpCodes?.size && dKey) {
+    return getAuditorsUniverse()
+      .map((master) => {
+        const code = normalizeEmpCode(master.empCode);
+        const attRaw = getAttendanceForAuditorOnDate(code, dKey);
+        const att = attRaw ? hydrateAttendanceRow(attRaw) : null;
+        const plan = getPlanForAuditorOnDate(code, master, dKey);
+        const { followed, distToPlan } = evaluatePjpFollowed(att, plan);
+        const noSubmission = !att;
+        return {
+          master,
+          code,
+          auditorName: master.name || att?.auditor || code,
+          onField: att ? att.onField : false,
+          location: att?.location || null,
+          absentReason: att?.absentReason || (noSubmission ? 'No submission' : null),
+          att,
+          noSubmission,
+          todayPlan: plan,
+          followed,
+          distToPlan,
+        };
+      })
+      .filter((e) => {
+        if (filter === 'on_field') return e.onField === true && !!e.location;
+        if (filter === 'absent') return !e.onField || e.noSubmission;
+        return true;
+      });
+  }
+
   return (STATE.dateFiltered || [])
     .map((r) => {
       const row = hydrateAttendanceRow(r);
       const master = findAuditor(row.auditor, row.auditorId);
+      const code = normalizeEmpCode(master?.empCode || row.auditorId || '');
+      const plan = getPlanForAuditorOnDate(code, master, dKey);
+      const { followed, distToPlan } = evaluatePjpFollowed(row, plan);
       return {
         master: master || {
           empCode: row.auditorId || '',
@@ -3924,13 +3975,16 @@ function buildCurrentLocationEntries() {
           lat: null,
           lng: null,
         },
-        code: normalizeEmpCode(master?.empCode || row.auditorId || ''),
+        code,
         auditorName: row.auditor || master?.name || 'Unknown',
         onField: row.onField,
         location: row.location || null,
         absentReason: row.absentReason,
         att: row,
         noSubmission: false,
+        todayPlan: plan,
+        followed,
+        distToPlan,
       };
     })
     .filter((e) => {
@@ -4144,6 +4198,13 @@ function setMapSection(section) {
     $('map-pjp-auditor').value = '';
     STATE.mapPjpSelectedAuditor = '';
   }
+  if (STATE.mapSection === 'roster' && $('map-pjp-auditor') && !$('map-pjp-auditor').value) {
+    const auditors = getAuditorsUniverse();
+    if (auditors.length === 1) {
+      $('map-pjp-auditor').value = normalizeEmpCode(auditors[0].empCode);
+      STATE.mapPjpSelectedAuditor = $('map-pjp-auditor').value;
+    }
+  }
   document.querySelectorAll('.map-tab').forEach((btn) => {
     btn.classList.toggle('active', btn.dataset.mapSection === STATE.mapSection);
   });
@@ -4175,9 +4236,11 @@ function updateMapSubtitle() {
     : '—';
   if (STATE.mapSection === 'roster') {
     const focus = $('map-pjp-auditor')?.value || '';
-    const visits = STATE.planRows.length ? buildRosterMarketVisitMarkers(focus || null).length : 0;
+    const visits = STATE.planRows.length && focus ? buildRosterPlanMarkers(focus).length : 0;
     const tableN = buildUnifiedAuditorTableRows().length;
-    let sub = `30-day PJP roster · ${dateStr} · ${visits} Market Visit points on map`;
+    let sub = focus
+      ? `30-day PJP roster · ${dateStr} · ${visits} planned days on map`
+      : `Select an auditor below to view their full-month PJP`;
     if (tableN) sub += ` · ${tableN} auditors in table`;
     if (focus) {
       const m = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focus));
@@ -4186,7 +4249,10 @@ function updateMapSubtitle() {
     if ($('map-sub')) $('map-sub').textContent = sub;
     return;
   }
+  const universe = STATE.pjpEmpCodes?.size || 0;
+  const withGps = buildCurrentLocationEntries().filter((e) => e.location).length;
   let sub = `Current locations · ${dateStr} · ${present.length} on field · ${absentSubmitted.length} absent`;
+  if (universe) sub = `Current locations · ${dateStr} · ${withGps} of ${universe} auditors with GPS`;
   if (notSubmitted) sub += ` · ${notSubmitted} no submission`;
   if ($('map-sub')) $('map-sub').textContent = sub;
 }
@@ -4238,14 +4304,18 @@ function renderMap() {
   else renderMapCurrentSection();
 }
 
-/** Section 1: all auditors — current GPS (+ home base) for the selected date. */
+/** Section 1: all PJP auditors — current GPS (+ PJP follow) for the selected date. */
 function renderMapCurrentSection() {
   const allPoints = [];
   const entries = buildCurrentLocationEntries();
+  const universe = STATE.pjpEmpCodes?.size || entries.length;
   const withGps = entries.filter((e) => e.location);
+
   withGps.forEach((e) => {
     const baseName = e.master.hometown || '—';
-    const currentColor = e.onField ? '#22c55e' : '#ef4444';
+    const followed = e.followed === 'Yes';
+    const notFollowed = e.followed === 'No' && e.onField && e.location;
+    const currentColor = followed ? '#22c55e' : notFollowed ? '#ef4444' : e.onField ? '#f59e0b' : '#ef4444';
     const currentName =
       nearestCityName(e.location.lat, e.location.lng) ||
       `${e.location.lat.toFixed(3)}, ${e.location.lng.toFixed(3)}`;
@@ -4253,6 +4323,9 @@ function renderMapCurrentSection() {
     if (e.master.lat != null) {
       distFromBase = haversineKm(e.master.lat, e.master.lng, e.location.lat, e.location.lng);
     }
+    const plannedTown = e.todayPlan?.toTown || '—';
+    const followLabel = e.followed === 'Yes' ? 'Followed PJP' : e.followed === 'No' ? 'Did not follow PJP' : '—';
+
     const currentMarker = L.circleMarker([e.location.lat, e.location.lng], {
       radius: 8,
       fillColor: currentColor,
@@ -4262,17 +4335,20 @@ function renderMapCurrentSection() {
       fillOpacity: 0.95,
     }).addTo(STATE.map);
     currentMarker.bindPopup(`
-      <div style="font-family:Inter,sans-serif;min-width:200px">
+      <div style="font-family:Inter,sans-serif;min-width:220px">
         <div style="font-weight:600;color:#0a0e1a">${escapeHtml(e.auditorName)}</div>
         <div style="font-size:10px;color:#9ca3af">${escapeHtml(e.code)} · ${escapeHtml(e.master.cluster || '—')}</div>
         <div style="font-size:11px;color:#374151">📍 ${escapeHtml(currentName)}</div>
+        <div style="font-size:11px;color:#6b7280">PJP planned: ${escapeHtml(plannedTown)}</div>
+        ${e.distToPlan != null ? `<div style="font-size:11px;color:#6b7280">${e.distToPlan.toFixed(1)} km from planned site</div>` : ''}
         <div style="font-size:11px;color:#6b7280">Base: ${escapeHtml(baseName)}</div>
         ${distFromBase != null ? `<div style="font-size:11px;color:#6b7280">${distFromBase.toFixed(1)} km from base</div>` : ''}
-        <div style="font-size:11px;color:${currentColor}"><strong>${e.onField ? 'On field' : escapeHtml(e.absentReason || 'Absent')}</strong></div>
+        <div style="font-size:11px;color:${currentColor}"><strong>${escapeHtml(followLabel)}</strong> · ${e.onField ? 'On field' : escapeHtml(e.absentReason || 'Absent')}</div>
       </div>
     `);
     STATE.markers.push(currentMarker);
     allPoints.push([e.location.lat, e.location.lng]);
+
     if (e.master.lat != null && e.master.lng != null) {
       const baseMarker = L.circleMarker([e.master.lat, e.master.lng], {
         radius: 5,
@@ -4298,32 +4374,44 @@ function renderMapCurrentSection() {
       STATE.lines.push(line);
     }
   });
+
   if (allPoints.length) {
     STATE.map.fitBounds(L.latLngBounds(allPoints), { padding: [48, 48], maxZoom: 7 });
   } else if (STATE.map) {
     STATE.map.setView([22.5, 79.0], 5);
   }
+
   const sub = $('map-sub');
   if (sub) {
     const dateStr = STATE.filteredDate
       ? new Date(STATE.filteredDate).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })
       : '—';
-    sub.textContent = `Current locations · ${dateStr} · ${withGps.length} GPS on map · ${entries.length} submissions`;
+    sub.textContent = universe
+      ? `Current locations · ${dateStr} · ${withGps.length} of ${universe} auditors with GPS on map`
+      : `Current locations · ${dateStr} · ${withGps.length} GPS on map · ${entries.length} submissions`;
   }
 }
 
-/** Section 2: 30-day Market Visits + current GPS; lines show km to each audit site (auditor filter). */
+/** Section 2: full-month PJP + current GPS for selected auditor. */
 function renderMapRosterSection() {
   const allPoints = [];
   const focusCode = $('map-pjp-auditor')?.value || '';
+  const todayKey = STATE.filteredDate ? dateKey(new Date(STATE.filteredDate)) : null;
+
+  if (!focusCode) {
+    const sub = $('map-sub');
+    if (sub) sub.textContent = 'Select an auditor from the dropdown to view their full-month PJP roster';
+    if (STATE.map) STATE.map.setView([22.5, 79.0], 5);
+    return;
+  }
+
   const gpsByCode = {};
   buildMapAuditorEntries().forEach((e) => {
     if (e.location) gpsByCode[e.code] = e;
   });
 
-  const focusMaster = focusCode
-    ? AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focusCode))
-    : null;
+  const focusMaster = AUDITOR_MASTER.find((a) => normalizeEmpCode(a.empCode) === normalizeEmpCode(focusCode));
+
   if (focusMaster?.lat != null && focusMaster.lng != null) {
     const baseMarker = L.circleMarker([focusMaster.lat, focusMaster.lng], {
       radius: 7,
@@ -4341,42 +4429,41 @@ function renderMapRosterSection() {
   }
 
   if (STATE.planRows.length) {
-    const upcoming = buildRosterMarketVisitMarkers(focusCode || null);
-    upcoming.forEach((v) => {
+    const planMarkers = buildRosterPlanMarkers(focusCode);
+    planMarkers.forEach((v) => {
+      const fillColor = v.isTravel ? '#3b82f6' : v.isMarketVisit ? '#a855f7' : '#64748b';
       const m = L.circleMarker([v.coords.lat, v.coords.lng], {
-        radius: v.isToday ? 7 : 5,
-        fillColor: '#a855f7',
-        color: '#0a0e1a',
-        weight: 1,
+        radius: v.isToday ? 8 : 5,
+        fillColor,
+        color: v.isToday ? '#fff' : '#0a0e1a',
+        weight: v.isToday ? 2 : 1,
         opacity: 1,
-        fillOpacity: v.isToday ? 0.95 : 0.7,
+        fillOpacity: v.isToday ? 0.95 : 0.75,
       }).addTo(STATE.map);
+
       const gps = gpsByCode[v.empCode];
-      const selectedKey = STATE.filteredDate ? dateKey(new Date(STATE.filteredDate)) : null;
       let distLine = '';
-      if (gps?.location) {
+      if (gps?.location && v.isToday) {
         const d = haversineKm(v.coords.lat, v.coords.lng, gps.location.lat, gps.location.lng);
-        distLine = `<div style="font-size:11px;color:#38bdf8"><strong>${d.toFixed(1)} km</strong> from GPS on selected date</div>`;
-        const drawLine =
-          focusCode && normalizeEmpCode(focusCode) === v.empCode
-            ? true
-            : !focusCode && selectedKey && v.dateKey === selectedKey;
-        if (drawLine) {
-          const matchColor = d <= PLANNED_SITE_MATCH_KM ? '#22c55e' : d > 100 ? '#ef4444' : '#f59e0b';
-          const line = L.polyline(
-            [
-              [gps.location.lat, gps.location.lng],
-              [v.coords.lat, v.coords.lng],
-            ],
-            { color: matchColor, weight: 1.2, opacity: 0.45, dashArray: '5, 4' }
-          ).addTo(STATE.map);
-          STATE.lines.push(line);
-        }
+        distLine = `<div style="font-size:11px;color:#38bdf8"><strong>${d.toFixed(1)} km</strong> from GPS today</div>`;
+        const matchColor = d <= PLANNED_SITE_MATCH_KM ? '#22c55e' : d > 100 ? '#ef4444' : '#f59e0b';
+        const line = L.polyline(
+          [
+            [gps.location.lat, gps.location.lng],
+            [v.coords.lat, v.coords.lng],
+          ],
+          { color: matchColor, weight: 2, opacity: 0.55, dashArray: '6, 4' }
+        ).addTo(STATE.map);
+        STATE.lines.push(line);
+      } else if (gps?.location) {
+        const d = haversineKm(v.coords.lat, v.coords.lng, gps.location.lat, gps.location.lng);
+        distLine = `<div style="font-size:11px;color:#9ca3af">${d.toFixed(1)} km from GPS on selected date</div>`;
       }
+
       m.bindPopup(`
         <div style="font-family:Inter,sans-serif;min-width:200px">
           <div style="font-weight:600;color:#0a0e1a">${escapeHtml(v.auditorName)}</div>
-          <div style="font-size:11px;color:#6b7280">Market Visit · ${escapeHtml(v.dateLabel)}</div>
+          <div style="font-size:11px;color:#6b7280">${escapeHtml(v.workType)} · ${escapeHtml(v.dateLabel)}</div>
           <div style="font-size:11px;color:#6b7280">📍 ${escapeHtml(v.town)} (Col H)</div>
           ${v.plan.fromTown ? `<div style="font-size:11px;color:#9ca3af">${escapeHtml(v.plan.fromTown)} → ${escapeHtml(v.town)}</div>` : ''}
           ${distLine}
@@ -4390,25 +4477,30 @@ function renderMapRosterSection() {
   const entries = buildMapAuditorEntries();
   entries.forEach((e) => {
     if (!e.location) return;
-    const currentColor = e.onField ? '#22c55e' : '#ef4444';
+    const followed = e.atExpected === true;
+    const notFollowed = e.atExpected === false;
+    const currentColor = followed ? '#22c55e' : notFollowed ? '#ef4444' : e.onField ? '#f59e0b' : '#ef4444';
     const currentName =
       nearestCityName(e.location.lat, e.location.lng) ||
       `${e.location.lat.toFixed(3)}, ${e.location.lng.toFixed(3)}`;
     const currentMarker = L.circleMarker([e.location.lat, e.location.lng], {
-      radius: 9,
+      radius: 11,
       fillColor: currentColor,
       color: '#fff',
-      weight: 2,
+      weight: 3,
       opacity: 1,
       fillOpacity: 0.95,
     }).addTo(STATE.map);
     const plannedToday = e.todayPlan?.toTown || '—';
+    const followLabel =
+      e.atExpected === true ? 'Followed PJP today' : e.atExpected === false ? 'Did not follow PJP today' : '—';
     currentMarker.bindPopup(`
       <div style="font-family:Inter,sans-serif;min-width:220px">
         <div style="font-weight:600;color:#0a0e1a">${escapeHtml(e.auditorName)}</div>
         <div style="font-size:11px;color:#6b7280">Current GPS · ${escapeHtml(currentName)}</div>
         <div style="font-size:11px;color:#6b7280">Today&apos;s PJP: ${escapeHtml(plannedToday)}</div>
         ${e.distFromPlanned != null ? `<div style="font-size:11px;color:#38bdf8">${e.distFromPlanned.toFixed(1)} km from today&apos;s planned site</div>` : ''}
+        <div style="font-size:11px;color:${currentColor}"><strong>${escapeHtml(followLabel)}</strong></div>
       </div>
     `);
     STATE.markers.push(currentMarker);
@@ -4416,10 +4508,12 @@ function renderMapRosterSection() {
   });
 
   if (allPoints.length) {
-    STATE.map.fitBounds(L.latLngBounds(allPoints), { padding: [48, 48], maxZoom: focusCode ? 9 : 6 });
+    STATE.map.fitBounds(L.latLngBounds(allPoints), { padding: [48, 48], maxZoom: focusCode ? 8 : 6 });
   } else if (focusMaster?.lat != null) {
     STATE.map.setView([focusMaster.lat, focusMaster.lng], 8);
   }
+
+  updateMapSubtitle();
 }
 
 $('map-filter').addEventListener('change', () => {
