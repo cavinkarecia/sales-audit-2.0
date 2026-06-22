@@ -780,6 +780,74 @@ html, body {
   border-color: rgba(59, 130, 246, 0.35);
   box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.08);
 }
+.audit-highlight {
+  background: rgba(59, 130, 246, 0.18);
+  color: var(--blue);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+}
+.audit-highlight.warn {
+  background: rgba(245, 158, 11, 0.2);
+  color: var(--amber);
+}
+.audit-highlight.bad {
+  background: rgba(239, 68, 68, 0.2);
+  color: var(--red);
+}
+.audit-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin-top: 10px;
+}
+.audit-table th,
+.audit-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.audit-table th {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+}
+.audit-table tr.flagged td {
+  background: rgba(239, 68, 68, 0.06);
+}
+.audit-table tr.supported td {
+  background: rgba(34, 197, 94, 0.04);
+}
+.audit-discrepancy {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  border: 1px solid rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.08);
+  color: var(--red);
+}
+.audit-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 12px;
+}
+.audit-summary-tile {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  font-size: 12px;
+}
+.audit-summary-tile .val {
+  font-size: 18px;
+  font-weight: 600;
+  font-family: 'JetBrains Mono', monospace;
+  margin-top: 4px;
+}
 .bill-preview-loading {
   justify-content: flex-start;
 }
@@ -1273,6 +1341,10 @@ html, body {
                 <div class="panel-sub">OCR bill extraction · duplicate &amp; collusion detection · ±10 min time window · stale bill date checks</div>
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button class="btn" id="multi-invoice-btn">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                  Multi-invoice PDF
+                </button>
                 <button class="btn btn-primary" id="new-claim-btn">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                   New Claim
@@ -1536,6 +1608,39 @@ html, body {
   </div>
 </div>
 
+<!-- ===== MULTI-INVOICE PDF AUDIT MODAL ===== -->
+<div class="modal-backdrop" id="multi-invoice-modal-backdrop">
+  <div class="modal" style="width:720px">
+    <div class="modal-head">
+      <div>
+        <div class="modal-title">Multi-invoice PDF audit</div>
+        <div class="text-dim" style="font-size:11px;margin-top:2px">Upload a reimbursement sheet with receipt images — AI flags false claims and highlights dates &amp; amounts</div>
+      </div>
+      <button class="drawer-close" id="multi-invoice-modal-close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-body">
+      <div class="bill-drop" id="multi-invoice-drop" style="min-height:110px;cursor:pointer">
+        <input type="file" id="multi-invoice-input" accept="application/pdf,.pdf" style="display:none" />
+        <div id="multi-invoice-preview">
+          <div style="font-size:13px;font-weight:500">Click to upload reimbursement PDF</div>
+          <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Sheet with multiple receipt images + claimed amounts · max 12 MB</div>
+        </div>
+      </div>
+      <div id="multi-invoice-progress" class="hidden" style="margin-top:14px;padding:12px;border-radius:8px;background:rgba(59,130,246,0.08);font-size:12px">
+        <span class="ai-spinner" style="vertical-align:middle;margin-right:8px"></span>
+        <span id="multi-invoice-progress-text">Processing…</span>
+      </div>
+      <div id="multi-invoice-result" class="hidden" style="margin-top:14px"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" id="multi-invoice-cancel">Close</button>
+      <button class="btn btn-primary" id="multi-invoice-run" disabled>Audit PDF</button>
+    </div>
+  </div>
+</div>
+
 <!-- ===== API KEY MODAL ===== -->
 <div class="modal-backdrop" id="apikey-modal-backdrop">
   <div class="modal" style="width:520px">
@@ -1622,7 +1727,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.27';
+const SENTINEL_BUILD = '2026.06.28';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -4926,6 +5031,193 @@ async function reloadClaimsFromBackend() {
   STATE._claimsLoaded = true;
 }
 
+function formatAuditDate(d) {
+  if (!d) return '—';
+  try {
+    return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+  } catch {
+    return d;
+  }
+}
+
+function renderMultiInvoiceAuditHtml(audit) {
+  if (!audit) return '';
+  const flaggedInvoiceIds = new Set();
+  const flaggedLineIds = new Set();
+  for (const d of audit.discrepancies || []) {
+    (d.relatedInvoiceIds || []).forEach((id) => flaggedInvoiceIds.add(id));
+    (d.relatedClaimLineIds || []).forEach((id) => flaggedLineIds.add(id));
+  }
+
+  const invoiceRows = (audit.invoices || []).map((inv) => {
+    const flagged = flaggedInvoiceIds.has(inv.id);
+    const dateCls = flagged ? 'audit-highlight bad' : 'audit-highlight';
+    const amtCls = flagged ? 'audit-highlight bad' : 'audit-highlight';
+    return `<tr class="${flagged ? 'flagged' : 'supported'}">
+      <td>${escapeHtml(inv.vendor || inv.billType || 'Receipt')}</td>
+      <td><span class="${dateCls}">${escapeHtml(formatAuditDate(inv.date))}</span></td>
+      <td><span class="${amtCls}">₹${inv.amount != null ? inv.amount.toLocaleString('en-IN') : '—'}</span></td>
+      <td class="text-dim">${escapeHtml(inv.pageHint || '')}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="4" class="text-dim">No receipts detected</td></tr>`;
+
+  const claimedRows = (audit.claimedLines || []).map((line) => {
+    const unsupported = !line.hasReceiptSupport || flaggedLineIds.has(line.id);
+    const cls = unsupported ? 'audit-highlight bad' : 'audit-highlight';
+    const rowCls = unsupported ? 'flagged' : 'supported';
+    return `<tr class="${rowCls}">
+      <td>${escapeHtml(line.label)}</td>
+      <td><span class="${cls}">₹${line.amount != null ? line.amount.toLocaleString('en-IN') : '—'}</span></td>
+      <td>${line.hasReceiptSupport ? '<span style="color:var(--green)">Receipt found</span>' : '<span style="color:var(--red);font-weight:600">No receipt</span>'}</td>
+    </tr>`;
+  }).join('') || `<tr><td colspan="3" class="text-dim">No claim lines detected on sheet</td></tr>`;
+
+  const discrepancyHtml = (audit.discrepancies || []).map((d) => `
+    <div class="audit-discrepancy">
+      <strong>${escapeHtml(d.type.replace(/_/g, ' '))}</strong> — ${escapeHtml(d.message)}
+      ${d.highlightDate ? `<div style="margin-top:4px">Date: <span class="audit-highlight bad">${escapeHtml(formatAuditDate(d.highlightDate))}</span></div>` : ''}
+      ${d.claimedAmount != null ? `<div style="margin-top:2px">Amount: <span class="audit-highlight bad">₹${d.claimedAmount.toLocaleString('en-IN')}</span></div>` : ''}
+    </div>
+  `).join('') || '<div class="text-dim" style="font-size:12px">No discrepancies — receipts support all claimed amounts.</div>';
+
+  const verdictColor = audit.overallVerdict === 'genuine' ? 'var(--green)' : audit.overallVerdict === 'suspicious' ? 'var(--red)' : 'var(--amber)';
+
+  return `
+    <div class="audit-summary-grid">
+      <div class="audit-summary-tile">
+        <div class="text-dim">Receipts total</div>
+        <div class="val" style="color:var(--green)">₹${(audit.totalReceiptAmount || 0).toLocaleString('en-IN')}</div>
+      </div>
+      <div class="audit-summary-tile">
+        <div class="text-dim">Claimed total</div>
+        <div class="val" style="color:${Math.abs((audit.totalClaimed || 0) - (audit.totalReceiptAmount || 0)) > 10 ? 'var(--red)' : 'var(--text)'}">₹${(audit.totalClaimed || 0).toLocaleString('en-IN')}</div>
+      </div>
+      <div class="audit-summary-tile">
+        <div class="text-dim">Verdict</div>
+        <div class="val" style="color:${verdictColor};font-size:14px;text-transform:capitalize">${escapeHtml(audit.overallVerdict || 'review')}</div>
+      </div>
+    </div>
+    ${audit.sheetDate ? `<div style="margin-top:10px;font-size:12px">Sheet date: <span class="audit-highlight">${escapeHtml(formatAuditDate(audit.sheetDate))}</span></div>` : ''}
+    ${audit.reasoning ? `<div style="margin-top:8px;font-size:12px;color:var(--text-dim)">${escapeHtml(audit.reasoning)}</div>` : ''}
+    <div style="margin-top:14px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-dim)">Detected invoices (date &amp; amount highlighted)</div>
+    <table class="audit-table">
+      <thead><tr><th>Vendor / type</th><th>Date</th><th>Amount</th><th>Location</th></tr></thead>
+      <tbody>${invoiceRows}</tbody>
+    </table>
+    <div style="margin-top:14px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-dim)">Claimed line items</div>
+    <table class="audit-table">
+      <thead><tr><th>Category</th><th>Amount</th><th>Receipt support</th></tr></thead>
+      <tbody>${claimedRows}</tbody>
+    </table>
+    <div style="margin-top:14px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-dim)">False claim / discrepancy flags</div>
+    ${discrepancyHtml}
+  `;
+}
+
+// --- Multi-invoice PDF audit ---
+let pendingMultiInvoicePdf = null;
+const multiInvoiceModal = $('multi-invoice-modal-backdrop');
+
+function isPdfFileClient(file) {
+  if (!file) return false;
+  const type = String(file.type || '').toLowerCase();
+  if (type === 'application/pdf' || type === 'application/x-pdf') return true;
+  return /\.pdf$/i.test(String(file.name || ''));
+}
+
+function openMultiInvoiceModal() {
+  pendingMultiInvoicePdf = null;
+  const input = $('multi-invoice-input');
+  if (input) input.value = '';
+  $('multi-invoice-preview').innerHTML = `
+    <div style="font-size:13px;font-weight:500">Click to upload reimbursement PDF</div>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Sheet with multiple receipt images + claimed amounts · max 12 MB</div>`;
+  $('multi-invoice-progress').classList.add('hidden');
+  $('multi-invoice-result').classList.add('hidden');
+  $('multi-invoice-run').disabled = true;
+  multiInvoiceModal.classList.add('open');
+}
+function closeMultiInvoiceModal() { multiInvoiceModal.classList.remove('open'); }
+
+$('multi-invoice-btn').addEventListener('click', openMultiInvoiceModal);
+$('multi-invoice-modal-close').addEventListener('click', closeMultiInvoiceModal);
+$('multi-invoice-cancel').addEventListener('click', closeMultiInvoiceModal);
+multiInvoiceModal.addEventListener('click', (e) => { if (e.target === multiInvoiceModal) closeMultiInvoiceModal(); });
+$('multi-invoice-drop').addEventListener('click', () => $('multi-invoice-input').click());
+$('multi-invoice-input').addEventListener('change', (e) => {
+  const file = e.target.files?.[0];
+  if (!file) return;
+  if (!isPdfFileClient(file)) { alert('PDF only.'); e.target.value = ''; return; }
+  if (file.size > 12 * 1024 * 1024) { alert('Max 12 MB.'); e.target.value = ''; return; }
+  pendingMultiInvoicePdf = file;
+  $('multi-invoice-preview').innerHTML = `<div class="bill-name">${escapeHtml(file.name)}</div><div class="bill-meta">${(file.size / 1024).toFixed(1)} KB · ready to audit</div>`;
+  $('multi-invoice-run').disabled = false;
+  $('multi-invoice-result').classList.add('hidden');
+});
+
+async function pollMultiInvoiceAuditJob(jobId) {
+  const deadline = Date.now() + 8 * 60 * 1000;
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+  while (Date.now() < deadline) {
+    const resp = await apiFetch(`/api/claims/multi-invoice-audit/${encodeURIComponent(jobId)}`);
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `Audit status failed (HTTP ${resp.status})`);
+    if (data.message) $('multi-invoice-progress-text').textContent = data.message;
+    if (data.status === 'done') return data;
+    if (data.status === 'failed') throw new Error(data.error || 'Multi-invoice audit failed');
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+  }
+  throw new Error('Audit timed out after 8 minutes. Try a smaller PDF.');
+}
+
+$('multi-invoice-run').addEventListener('click', async () => {
+  if (!pendingMultiInvoicePdf) {
+    alert('Select a PDF first.');
+    return;
+  }
+  if (!hasAiKeyReady()) {
+    alert('Set Anthropic API key first (AI Key chip).');
+    openApiKeyModal();
+    return;
+  }
+  if (!USE_BACKEND) {
+    alert('Multi-invoice audit requires server mode (deploy on Render).');
+    return;
+  }
+  $('multi-invoice-progress').classList.remove('hidden');
+  $('multi-invoice-result').classList.add('hidden');
+  $('multi-invoice-progress-text').textContent = 'Uploading PDF…';
+  $('multi-invoice-run').disabled = true;
+  try {
+    await ensureBackendSession();
+    const fd = new FormData();
+    fd.append('pdf', pendingMultiInvoicePdf);
+    const resp = await apiFetch('/api/claims/multi-invoice-audit', { method: 'POST', body: fd });
+    const startData = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(startData.error || `Audit failed (${resp.status})`);
+    if (!startData.jobId) throw new Error('Server did not start audit job.');
+
+    $('multi-invoice-progress-text').textContent = startData.message || 'AI reading invoices…';
+    const data = await pollMultiInvoiceAuditJob(startData.jobId);
+
+    await reloadClaimsFromBackend();
+    renderClaimsList();
+    renderExpenseValidationStats();
+
+    const audit = data.auditResult;
+    $('multi-invoice-result').classList.remove('hidden');
+    $('multi-invoice-result').innerHTML = renderMultiInvoiceAuditHtml(audit);
+    $('multi-invoice-progress-text').textContent = 'Done.';
+    pendingMultiInvoicePdf = null;
+    $('multi-invoice-run').disabled = true;
+  } catch (err) {
+    $('multi-invoice-result').classList.remove('hidden');
+    $('multi-invoice-result').innerHTML = `<div class="audit-discrepancy">${escapeHtml(err.message || 'Audit failed')}</div>`;
+    $('multi-invoice-progress-text').textContent = 'Failed.';
+    $('multi-invoice-run').disabled = !pendingMultiInvoicePdf;
+  }
+});
+
 $('claim-modal-close').addEventListener('click', closeClaimModal);
 $('claim-cancel').addEventListener('click', closeClaimModal);
 claimModal.addEventListener('click', (e) => {
@@ -5863,7 +6155,9 @@ function renderClaimsList() {
       collusion: { label: 'Collusion escalated', icon: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>' },
     };
     const v = verdictMap[c.verdict] || verdictMap.review;
-    const subPill = c.category === 'TA'
+    const subPill = c.multiInvoiceAudit
+      ? `<span class="cluster-pill cluster-west">Multi-invoice PDF audit</span>`
+      : c.category === 'TA'
       ? `<span class="cluster-pill cluster-west">TA · ${escapeHtml(c.subcategoryLabel)}</span>`
       : `<span class="cluster-pill cluster-rapt">DA · ${escapeHtml(c.subcategoryLabel)}</span>`;
     const dateStr = new Date(c.date).toLocaleDateString('en-IN', { day:'numeric', month:'short', year:'numeric' });
@@ -5893,6 +6187,11 @@ function renderClaimsList() {
           </div>
           ${c.reason ? `<div class="claim-detail">Portal-bypass reason: <em>${escapeHtml(c.reason)}</em></div>` : ''}
           ${c.notes ? `<div class="claim-detail">Notes: ${escapeHtml(c.notes)}</div>` : ''}
+          ${c.multiInvoiceAudit && c.auditResult ? `
+            <div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border)">
+              ${renderMultiInvoiceAuditHtml(c.auditResult)}
+            </div>
+          ` : ''}
           ${c.geo ? `
             <div class="claim-detail" style="margin-top:6px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="flex-shrink:0;color:${c.geo.distFromHome != null && c.geo.distFromHome <= 5 ? 'var(--red)' : 'var(--text-dim)'}"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>

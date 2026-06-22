@@ -29,6 +29,10 @@ const {
   slimClaimForClient,
 } = require('./lib/bulk-pdf');
 const {
+  analyzeMultiInvoicePdfBuffer,
+  buildClaimFromAudit,
+} = require('./lib/multi-invoice-audit');
+const {
   createBulkPdfJob,
   updateBulkPdfJob,
   getBulkPdfJob,
@@ -120,6 +124,66 @@ async function runBulkPdfJob(jobId, { sessionId, apiKey, fileBuffer, fileName })
       status: 'failed',
       error: err.message || 'Bulk PDF processing failed',
       message: 'Bulk PDF processing failed.',
+    });
+  }
+}
+
+async function runMultiInvoiceAuditJob(jobId, { sessionId, apiKey, fileBuffer, fileName }) {
+  try {
+    await updateBulkPdfJob(jobId, {
+      status: 'scanning',
+      message: 'AI reading invoices and claimed amounts…',
+    });
+
+    const pdfHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+    const pdfMeta = { fileName, pdfHash };
+
+    const audit = await analyzeMultiInvoicePdfBuffer(fileBuffer, apiKey);
+    if (!audit.invoices.length && !audit.claimedLines.length) {
+      await updateBulkPdfJob(jobId, {
+        status: 'failed',
+        error: 'No invoices or claim lines detected in this PDF.',
+        message: 'No invoices or claim lines detected in this PDF.',
+      });
+      return;
+    }
+
+    await updateBulkPdfJob(jobId, {
+      status: 'verifying',
+      message: `Found ${audit.invoices.length} receipt(s) · checking for false claims…`,
+      detected: audit.invoices.length,
+    });
+
+    const claim = buildClaimFromAudit(audit, pdfMeta);
+    await ensureSession(sessionId);
+    await getPool().query(
+      `INSERT INTO claims (id, session_id, payload, created_at, updated_at)
+       VALUES ($1, $2, $3::jsonb, NOW(), NOW())`,
+      [claim.id, sessionId, JSON.stringify(claim)]
+    );
+
+    const warning = audit.partial
+      ? 'AI output may be incomplete — split very large PDFs if needed.'
+      : audit.discrepancies.length
+        ? `${audit.discrepancies.length} issue(s) flagged — review highlighted amounts and dates.`
+        : null;
+
+    await updateBulkPdfJob(jobId, {
+      status: 'done',
+      message: audit.overallVerdict === 'genuine'
+        ? `Verified — ${audit.invoices.length} receipt(s) support claimed ₹${audit.totalClaimed}.`
+        : `Audit complete — ${audit.discrepancies.length} discrepancy(ies) found.`,
+      resultCount: 1,
+      partial: audit.partial,
+      warning,
+      auditResult: { ...audit, claimId: claim.id },
+    });
+  } catch (err) {
+    console.error('Multi-invoice audit job failed:', err);
+    await updateBulkPdfJob(jobId, {
+      status: 'failed',
+      error: err.message || 'Multi-invoice audit failed',
+      message: 'Multi-invoice audit failed.',
     });
   }
 }
@@ -340,7 +404,7 @@ app.get('/health', (_req, res) => {
   res.json({
     ok: true,
     service: 'sentinel-backend',
-    build: '2026.06.27-main',
+    build: '2026.06.28-main',
     renderBranch: process.env.RENDER_GIT_BRANCH || null,
     renderService: process.env.RENDER_SERVICE_NAME || null,
   });
@@ -722,6 +786,62 @@ app.get('/api/claims/bulk-pdf/:jobId', authRequired, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || 'Could not read bulk upload status' });
+  }
+});
+
+app.post('/api/claims/multi-invoice-audit', authRequired, upload.single('pdf'), async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const apiKey = getClientApiKey(req);
+    if (!apiKey) {
+      return res.status(400).json({
+        error: 'Paste your Anthropic API key using the "AI Key" chip in the header.',
+      });
+    }
+    if (!isPdfUpload(req.file)) {
+      return res.status(400).json({ error: 'Upload a PDF file.' });
+    }
+    if (req.file.buffer.length > MAX_PDF_BYTES) {
+      const mb = (req.file.buffer.length / (1024 * 1024)).toFixed(1);
+      return res.status(400).json({
+        error: `PDF is too large (${mb} MB). Maximum is ${MAX_PDF_BYTES / (1024 * 1024)} MB.`,
+      });
+    }
+
+    await ensureSession(sessionId);
+    const jobId = await createBulkPdfJob(sessionId, req.file.originalname, 'multi_invoice_audit');
+    const fileBuffer = req.file.buffer;
+    const fileName = req.file.originalname;
+
+    res.status(202).json({ jobId, status: 'queued', message: 'Multi-invoice audit started.' });
+
+    runMultiInvoiceAuditJob(jobId, { sessionId, apiKey, fileBuffer, fileName }).catch(async (err) => {
+      console.error(err);
+      await updateBulkPdfJob(jobId, {
+        status: 'failed',
+        error: err.message || 'Multi-invoice audit failed',
+        message: 'Multi-invoice audit failed.',
+      });
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Multi-invoice audit failed' });
+  }
+});
+
+app.get('/api/claims/multi-invoice-audit/:jobId', authRequired, async (req, res) => {
+  try {
+    const sessionId = getSessionId(req);
+    if (!sessionId) return res.status(400).json({ error: 'Missing X-Session-Id header' });
+    const job = await getBulkPdfJob(req.params.jobId);
+    if (!job || job.session_id !== sessionId) {
+      return res.status(404).json({ error: 'Audit job not found or expired.' });
+    }
+    res.json(serializeBulkPdfJob(job));
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message || 'Could not read audit status' });
   }
 });
 

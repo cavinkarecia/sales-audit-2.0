@@ -1,12 +1,12 @@
 const crypto = require('crypto');
 const { getPool } = require('../db');
 
-async function createBulkPdfJob(sessionId, fileName) {
+async function createBulkPdfJob(sessionId, fileName, jobType = 'bulk') {
   const jobId = crypto.randomUUID();
   await getPool().query(
-    `INSERT INTO bulk_pdf_jobs (id, session_id, status, message, file_name)
-     VALUES ($1, $2, 'queued', 'Upload received — starting…', $3)`,
-    [jobId, sessionId, fileName]
+    `INSERT INTO bulk_pdf_jobs (id, session_id, status, message, file_name, job_type)
+     VALUES ($1, $2, 'queued', 'Upload received — starting…', $3, $4)`,
+    [jobId, sessionId, fileName, jobType]
   );
   return jobId;
 }
@@ -24,6 +24,7 @@ async function updateBulkPdfJob(jobId, patch = {}) {
     result_count: 'resultCount',
     partial: 'partial',
     warning: 'warning',
+    audit_result: 'auditResult',
   };
 
   for (const [col, key] of Object.entries(allowed)) {
@@ -62,6 +63,8 @@ function serializeBulkPdfJob(row) {
     partial: row.partial,
     warning: row.warning,
     fileName: row.file_name,
+    jobType: row.job_type || 'bulk',
+    auditResult: row.audit_result || null,
     updatedAt: row.updated_at,
   };
 }

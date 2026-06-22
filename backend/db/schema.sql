@@ -65,8 +65,13 @@ CREATE TABLE IF NOT EXISTS bulk_pdf_jobs (
   result_count INTEGER,
   partial BOOLEAN NOT NULL DEFAULT FALSE,
   warning TEXT,
+  job_type TEXT NOT NULL DEFAULT 'bulk',
+  audit_result JSONB,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_bulk_pdf_jobs_session ON bulk_pdf_jobs(session_id);
+
+ALTER TABLE bulk_pdf_jobs ADD COLUMN IF NOT EXISTS job_type TEXT NOT NULL DEFAULT 'bulk';
+ALTER TABLE bulk_pdf_jobs ADD COLUMN IF NOT EXISTS audit_result JSONB;
