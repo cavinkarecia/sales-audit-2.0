@@ -1273,10 +1273,6 @@ html, body {
                 <div class="panel-sub">OCR bill extraction · duplicate &amp; collusion detection · ±10 min time window · stale bill date checks</div>
               </div>
               <div style="display:flex;gap:8px;flex-wrap:wrap">
-                <button class="btn" id="bulk-claim-btn">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
-                  Bulk PDF upload
-                </button>
                 <button class="btn btn-primary" id="new-claim-btn">
                   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
                   New Claim
@@ -1540,39 +1536,6 @@ html, body {
   </div>
 </div>
 
-<!-- ===== BULK PDF MODAL ===== -->
-<div class="modal-backdrop" id="bulk-claim-modal-backdrop">
-  <div class="modal" style="width:640px">
-    <div class="modal-head">
-      <div>
-        <div class="modal-title">Bulk PDF — Multi-auditor bills</div>
-        <div class="text-dim" style="font-size:11px;margin-top:2px">AI reads one PDF and creates separate expenses with Pass/Fail validation</div>
-      </div>
-      <button class="drawer-close" id="bulk-claim-modal-close">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
-      </button>
-    </div>
-    <div class="modal-body">
-      <div class="bill-drop" id="bulk-pdf-drop" style="min-height:120px;cursor:pointer">
-        <input type="file" id="bulk-pdf-input" accept="application/pdf" style="display:none" />
-        <div id="bulk-pdf-preview">
-          <div style="font-size:13px;font-weight:500">Click to upload bulk PDF</div>
-          <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Multiple auditors' bills in one file · max 15 MB</div>
-        </div>
-      </div>
-      <div id="bulk-progress" class="hidden" style="margin-top:14px;padding:12px;border-radius:8px;background:rgba(59,130,246,0.08);font-size:12px">
-        <span class="ai-spinner" style="vertical-align:middle;margin-right:8px"></span>
-        <span id="bulk-progress-text">Processing…</span>
-      </div>
-      <div id="bulk-result" class="hidden" style="margin-top:14px;font-size:12px"></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn" id="bulk-claim-cancel">Close</button>
-      <button class="btn btn-primary" id="bulk-claim-process" disabled>Detect bills &amp; generate expenses</button>
-    </div>
-  </div>
-</div>
-
 <!-- ===== API KEY MODAL ===== -->
 <div class="modal-backdrop" id="apikey-modal-backdrop">
   <div class="modal" style="width:520px">
@@ -1659,7 +1622,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.26';
+const SENTINEL_BUILD = '2026.06.27';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -4945,48 +4908,6 @@ function isInArtifactContext() {
 const claimModal = $('claim-modal-backdrop');
 $('new-claim-btn').addEventListener('click', openClaimModal);
 
-// --- Bulk PDF upload ---
-let pendingBulkPdfFile = null;
-const bulkClaimModal = $('bulk-claim-modal-backdrop');
-
-function isPdfFile(file) {
-  if (!file) return false;
-  const type = String(file.type || '').toLowerCase();
-  if (type === 'application/pdf' || type === 'application/x-pdf') return true;
-  return /\.pdf$/i.test(String(file.name || ''));
-}
-
-function openBulkClaimModal() {
-  pendingBulkPdfFile = null;
-  const input = $('bulk-pdf-input');
-  if (input) input.value = '';
-  $('bulk-pdf-preview').innerHTML = `
-    <div style="font-size:13px;font-weight:500">Click to upload bulk PDF</div>
-    <div style="font-size:11px;color:var(--text-dim);margin-top:4px">Multiple auditors' bills in one file · max 15 MB</div>`;
-  $('bulk-progress').classList.add('hidden');
-  $('bulk-result').classList.add('hidden');
-  $('bulk-claim-process').disabled = true;
-  bulkClaimModal.classList.add('open');
-}
-function closeBulkClaimModal() { bulkClaimModal.classList.remove('open'); }
-
-$('bulk-claim-btn').addEventListener('click', openBulkClaimModal);
-$('bulk-claim-modal-close').addEventListener('click', closeBulkClaimModal);
-$('bulk-claim-cancel').addEventListener('click', closeBulkClaimModal);
-bulkClaimModal.addEventListener('click', (e) => { if (e.target === bulkClaimModal) closeBulkClaimModal(); });
-$('bulk-pdf-drop').addEventListener('click', () => $('bulk-pdf-input').click());
-$('bulk-pdf-input').addEventListener('change', (e) => {
-  const file = e.target.files?.[0];
-  if (file) {
-    if (!isPdfFile(file)) { alert('PDF only.'); e.target.value = ''; return; }
-    if (file.size > 15 * 1024 * 1024) { alert('Max 15 MB.'); e.target.value = ''; return; }
-    pendingBulkPdfFile = file;
-    $('bulk-pdf-preview').innerHTML = `<div class="bill-name">${escapeHtml(file.name)}</div><div class="bill-meta">${(file.size/1024).toFixed(1)} KB · ready</div>`;
-    $('bulk-claim-process').disabled = false;
-    $('bulk-result').classList.add('hidden');
-  }
-});
-
 async function reloadClaimsFromBackend() {
   const resp = await apiFetch('/api/claims');
   const raw = await resp.text();
@@ -5004,88 +4925,6 @@ async function reloadClaimsFromBackend() {
   }));
   STATE._claimsLoaded = true;
 }
-
-async function pollBulkPdfJob(jobId) {
-  const deadline = Date.now() + 8 * 60 * 1000;
-  await new Promise((resolve) => setTimeout(resolve, 1500));
-  while (Date.now() < deadline) {
-    const resp = await apiFetch(`/api/claims/bulk-pdf/${encodeURIComponent(jobId)}`);
-    const raw = await resp.text();
-    let data = {};
-    try { data = raw ? JSON.parse(raw) : {}; } catch {
-      throw new Error(`Could not check bulk upload status (HTTP ${resp.status})`);
-    }
-    if (!resp.ok) throw new Error(data.error || `Could not check bulk upload status (HTTP ${resp.status})`);
-
-    if (data.message) $('bulk-progress-text').textContent = data.message;
-
-    if (data.status === 'done') return data;
-    if (data.status === 'failed') throw new Error(data.error || 'Bulk upload failed');
-
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-  }
-  throw new Error('Bulk upload timed out after 8 minutes. Try a smaller PDF or split by auditor.');
-}
-
-function claimPassFail(c) {
-  if (c.verdict === 'pending') return 'pending';
-  if (c.verdict === 'genuine') return 'pass';
-  return 'fail';
-}
-
-$('bulk-claim-process').addEventListener('click', async () => {
-  if (!pendingBulkPdfFile) {
-    alert('Select a PDF first — click the upload box above.');
-    return;
-  }
-  if (!hasAiKeyReady()) {
-    alert('Set Anthropic API key first (AI Key chip).');
-    openApiKeyModal();
-    return;
-  }
-  if (!USE_BACKEND) {
-    alert('Bulk PDF requires server mode (deploy on Render).');
-    return;
-  }
-  $('bulk-progress').classList.remove('hidden');
-  $('bulk-result').classList.add('hidden');
-  $('bulk-progress-text').textContent = 'Uploading PDF…';
-  $('bulk-claim-process').disabled = true;
-  try {
-    await ensureBackendSession();
-    const fd = new FormData();
-    fd.append('pdf', pendingBulkPdfFile);
-    const resp = await apiFetch('/api/claims/bulk-pdf', { method: 'POST', body: fd });
-    const startData = await resp.json().catch(() => null);
-    if (!resp.ok) throw new Error(startData?.error || `Bulk upload failed (${resp.status})`);
-    if (!startData?.jobId) throw new Error('Server did not start bulk upload job.');
-
-    $('bulk-progress-text').textContent = startData.message || 'AI scanning PDF for bills…';
-    const data = await pollBulkPdfJob(startData.jobId);
-
-    const uploadedName = pendingBulkPdfFile.name;
-    await reloadClaimsFromBackend();
-    renderClaimsList();
-    renderExpenseValidationStats();
-    const newClaims = STATE.claims.filter(c => c.bulkImport && c.billFileName === uploadedName);
-    const passN = newClaims.filter(c => claimPassFail(c) === 'pass').length;
-    const failN = newClaims.filter(c => claimPassFail(c) === 'fail').length;
-    const count = data.count || newClaims.length;
-    const partialNote = data.partial && data.warning
-      ? `<div style="margin-top:8px;font-size:12px;color:var(--amber)">${escapeHtml(data.warning)}</div>`
-      : '';
-    $('bulk-result').classList.remove('hidden');
-    $('bulk-result').innerHTML = `<div style="padding:12px;border-radius:8px;background:rgba(34,197,94,0.08);border:1px solid rgba(34,197,94,0.25)">Created <strong>${count}</strong> expenses · <span style="color:var(--green)">${passN} Pass</span> · <span style="color:var(--red)">${failN} Fail</span>${partialNote}<div style="margin-top:8px;font-size:11px;color:var(--text-dim)">Scroll down to Expense Claims to review them.</div></div>`;
-    $('bulk-progress-text').textContent = 'Done.';
-    pendingBulkPdfFile = null;
-    $('bulk-claim-process').disabled = true;
-  } catch (err) {
-    $('bulk-result').classList.remove('hidden');
-    $('bulk-result').innerHTML = `<div style="padding:12px;color:var(--red)">${escapeHtml(err.message || 'Bulk upload failed')}</div>`;
-    $('bulk-progress-text').textContent = 'Failed.';
-    $('bulk-claim-process').disabled = !pendingBulkPdfFile;
-  }
-});
 
 $('claim-modal-close').addEventListener('click', closeClaimModal);
 $('claim-cancel').addEventListener('click', closeClaimModal);
