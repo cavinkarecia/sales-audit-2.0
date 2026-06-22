@@ -115,7 +115,11 @@ function parseExcelDate(v) {
 function dateKey(d) {
   if (!d) return null;
   const dt = d instanceof Date ? d : new Date(d);
-  return dt.toISOString().slice(0, 10);
+  if (Number.isNaN(dt.getTime())) return null;
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, '0');
+  const day = String(dt.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 function parseKms(v) {
@@ -135,14 +139,14 @@ function parseYesNo(v) {
 
 function serializeDate(d) {
   if (!d) return null;
-  const dt = d instanceof Date ? d : new Date(d);
-  return Number.isNaN(dt.getTime()) ? null : dt.toISOString();
+  const dk = dateKey(d);
+  return dk ? `${dk}T12:00:00.000Z` : null;
 }
 
 function reviveDatesInRows(rows) {
   return rows.map((r) => ({
     ...r,
-    date: r.date ? new Date(r.date) : null,
+    date: r.date ? new Date(String(r.date).slice(0, 10) + 'T12:00:00') : null,
   }));
 }
 

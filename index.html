@@ -1727,7 +1727,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.06.28';
+const SENTINEL_BUILD = '2026.06.29';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -1825,7 +1825,9 @@ function applyPjpAttendanceScope() {
   const all = (STATE.rawRowsAll?.length ? STATE.rawRowsAll : STATE.rawRows) || [];
   const mapped = all.map((r) => ({
     ...r,
-    date: r.date ? (r.date instanceof Date ? r.date : new Date(r.date)) : null,
+    date: r.date
+      ? (r.date instanceof Date ? r.date : new Date(String(r.date).slice(0, 10) + 'T12:00:00'))
+      : null,
   }));
   STATE.rawRowsAll = mapped;
   STATE.attendanceRowCountTotal = mapped.length;
@@ -1843,7 +1845,7 @@ function applyAttendanceFromServer(data) {
   const mapped = (data.rawRowsAll || data.rawRows || []).map((r) =>
     hydrateAttendanceRow({
       ...r,
-      date: r.date ? new Date(r.date) : null,
+      date: r.date ? new Date(String(r.date).slice(0, 10) + 'T12:00:00') : null,
     })
   );
   STATE.rawRowsAll = mapped;
@@ -1856,10 +1858,20 @@ function applyAttendanceFromServer(data) {
 
 function applyPjpFromServer(data) {
   STATE.pjpFileName = data.pjpFileName || null;
-  STATE.planRows = (data.planRows || []).map(p => ({ ...p, date: p.date ? new Date(p.date) : null }));
+  let planRows = (data.planRows || []).map(p => ({
+    ...p,
+    date: p.date ? new Date(String(p.date).slice(0, 10) + 'T12:00:00') : null,
+  }));
   STATE.pjpMonth = data.pjpMonth || null;
-  STATE.pjpMinDate = data.pjpMinDate ? new Date(data.pjpMinDate) : null;
-  STATE.pjpMaxDate = data.pjpMaxDate ? new Date(data.pjpMaxDate) : null;
+  STATE.pjpMinDate = data.pjpMinDate ? new Date(String(data.pjpMinDate).slice(0, 10) + 'T12:00:00') : null;
+  STATE.pjpMaxDate = data.pjpMaxDate ? new Date(String(data.pjpMaxDate).slice(0, 10) + 'T12:00:00') : null;
+  if (STATE.pjpMonth) {
+    planRows = planRows.filter((p) => {
+      if (!p.date) return false;
+      return p.date.getFullYear() === STATE.pjpMonth.year && p.date.getMonth() === STATE.pjpMonth.month - 1;
+    });
+  }
+  STATE.planRows = planRows;
   STATE.planRowCount = STATE.planRows.length;
   const planIdx = rebuildPlanIndexesFromRows(STATE.planRows);
   STATE.planByEmpDate = planIdx.planByEmpDate;
@@ -2004,10 +2016,13 @@ async function reloadWorkspaceAfterUpload(kind, data) {
     await loadPjpFromBackend();
     STATE.pjpFileName = data.pjpFileName || STATE.pjpFileName;
     STATE.pjpMonth = data.pjpMonth || STATE.pjpMonth;
-    if (data.pjpMinDate) STATE.pjpMinDate = new Date(data.pjpMinDate);
-    if (data.pjpMaxDate) STATE.pjpMaxDate = new Date(data.pjpMaxDate);
+    if (data.pjpMinDate) STATE.pjpMinDate = new Date(String(data.pjpMinDate).slice(0, 10) + 'T12:00:00');
+    if (data.pjpMaxDate) STATE.pjpMaxDate = new Date(String(data.pjpMaxDate).slice(0, 10) + 'T12:00:00');
     if (data.pjpEmpCodes) STATE.pjpEmpCodes = new Set(data.pjpEmpCodes);
     STATE.planRowCount = data.planRowCount || STATE.planRows.length;
+    if (STATE.pjpMinDate) $('date-filter').min = dateKey(STATE.pjpMinDate);
+    if (STATE.pjpMaxDate) $('date-filter').max = dateKey(STATE.pjpMaxDate);
+    applyPjpAttendanceScope();
   }
   if (data.filteredDate) {
     STATE.filteredDate = data.filteredDate;
@@ -2699,7 +2714,8 @@ async function handleFile(file, kind) {
       const ws = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
       if (!rows.length) { alert('The attendance file appears empty.'); return; }
-      STATE.rawRowsAll = rows.map(normalizeRow);
+      const colGValues = extractAttendanceColumnG(ws);
+      STATE.rawRowsAll = rows.map((r, i) => normalizeRow(r, colGValues[i]));
       STATE.attendanceFileName = file.name;
       applyPjpAttendanceScope();
 
@@ -2722,8 +2738,8 @@ async function handleFile(file, kind) {
         $('date-filter').value = STATE.filteredDate;
       }
     } else if (kind === 'pjp') {
-      // PJP file: one sheet per auditor, each sheet has 30 rows (one per day in April)
-      STATE.planRows = [];
+      // PJP file: one sheet per auditor, each sheet has 30 rows (one per day in month)
+      const planRowsAll = [];
       STATE.planByEmpDate = {};
       STATE.planByNameDate = {};
       STATE.pjpEmpCodes = new Set();
@@ -2734,20 +2750,13 @@ async function handleFile(file, kind) {
           const plan = normalizePlanRow(r, sheetName);
           if (!plan.date || (!plan.empCode && !plan.empName)) continue;
           if (plan.empCode) plan.empCode = normalizeEmpCode(plan.empCode);
-          STATE.planRows.push(plan);
-          if (plan.empCode) {
-            STATE.planByEmpDate[`${plan.empCode}|${plan.dateKey}`] = plan;
-            STATE.pjpEmpCodes.add(plan.empCode);
-          }
-          if (plan.empName) {
-            STATE.planByNameDate[`${normalizeName(plan.empName)}|${plan.dateKey}`] = plan;
-          }
+          planRowsAll.push(plan);
         }
       }
       STATE.pjpFileName = file.name;
 
       // Derive the month covered by the PJP (most common month across plan dates)
-      const dates = STATE.planRows.map(p => p.date).filter(Boolean);
+      const dates = planRowsAll.map(p => p.date).filter(Boolean);
       if (dates.length) {
         // Count occurrences of each YYYY-MM
         const monthCounts = {};
@@ -2767,10 +2776,30 @@ async function handleFile(file, kind) {
         STATE.pjpMinDate = new Date(Math.min(...inMonth.map(d => d.getTime())));
         STATE.pjpMaxDate = new Date(Math.max(...inMonth.map(d => d.getTime())));
 
+        // Keep only plan rows for the detected PJP month (e.g. May only)
+        STATE.planRows = planRowsAll.filter((p) => {
+          if (!p.date) return false;
+          return p.date.getFullYear() === y && p.date.getMonth() === m - 1;
+        });
+        STATE.planByEmpDate = {};
+        STATE.planByNameDate = {};
+        STATE.pjpEmpCodes = new Set();
+        for (const plan of STATE.planRows) {
+          if (plan.empCode) {
+            STATE.planByEmpDate[`${plan.empCode}|${plan.dateKey}`] = plan;
+            STATE.pjpEmpCodes.add(plan.empCode);
+          }
+          if (plan.empName) {
+            STATE.planByNameDate[`${normalizeName(plan.empName)}|${plan.dateKey}`] = plan;
+          }
+        }
+
         // Constrain the date picker
         const dateInput = $('date-filter');
         dateInput.min = dateKey(STATE.pjpMinDate);
         dateInput.max = dateKey(STATE.pjpMaxDate);
+      } else {
+        STATE.planRows = planRowsAll;
       }
 
       if (STATE.rawRowsAll.length) {
@@ -2924,13 +2953,50 @@ function updateDualSummary() {
 }
 
 // Normalize one Excel row → canonical shape we can render
-function normalizeRow(r) {
-  const loc = parseLocation(r['Location'] || r.Location || r.location);
+const ATTENDANCE_GPS_COL_INDEX = 6;
+const ATTENDANCE_LOCATION_HEADERS = [
+  'Location', 'location', 'GPS', 'gps', 'Lat Long', 'Lat/Long',
+  'Latitude Longitude', 'Current Location', 'Geo Location', 'Geo',
+];
+
+function extractAttendanceColumnG(ws) {
+  if (!ws || !ws['!ref']) return [];
+  const range = XLSX.utils.decode_range(ws['!ref']);
+  const values = [];
+  for (let R = range.s.r + 1; R <= range.e.r; R++) {
+    const cell = ws[XLSX.utils.encode_cell({ r: R, c: ATTENDANCE_GPS_COL_INDEX })];
+    values.push(cell != null && cell.v != null ? cell.v : null);
+  }
+  return values;
+}
+
+function resolveAttendanceLocationClient(r, colGValue) {
+  for (const key of ATTENDANCE_LOCATION_HEADERS) {
+    if (r[key] != null && r[key] !== '') {
+      const loc = parseLocation(r[key]);
+      if (loc) return loc;
+    }
+  }
+  if (colGValue != null && colGValue !== '') {
+    const loc = parseLocation(colGValue);
+    if (loc) return loc;
+  }
+  for (const val of Object.values(r)) {
+    if (typeof val === 'string' && /-?\d+\.?\d*\s*[,;]\s*-?\d+\.?\d*/.test(val)) {
+      const loc = parseLocation(val);
+      if (loc) return loc;
+    }
+  }
+  return null;
+}
+
+function normalizeRow(r, colGValue) {
+  const loc = resolveAttendanceLocationClient(r, colGValue);
   return {
     id: r['ID'],
-    date: parseExcelDate(r['Choose Date'] || r['Date Collected']),
-    auditor: r['Choose Your Name'],
-    auditorId: r['User'],
+    date: parseExcelDate(r['Choose Date'] || r['Date Collected'] || r['Choose date'] || r.Date || r.date),
+    auditor: r['Choose Your Name'] || r['Auditor Name'] || r.auditor || r['Employee Name'],
+    auditorId: r.User,
     onField: r['Are You on field Today?'] === 'Yes',
     asPerPlan: r["Is today's audit as per planned?"],
     absentReason: r['Absent Reason'],
