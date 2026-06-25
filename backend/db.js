@@ -21,7 +21,25 @@ function getPool() {
 async function initDb() {
   const schemaPath = path.join(__dirname, 'db', 'schema.sql');
   const sql = fs.readFileSync(schemaPath, 'utf8');
-  await getPool().query(sql);
+  try {
+    await getPool().query(sql);
+  } catch (err) {
+    if (err.code === 'ENOTFOUND' || /getaddrinfo ENOTFOUND/i.test(String(err.message))) {
+      const host = (() => {
+        try {
+          return new URL(process.env.DATABASE_URL.replace(/^postgres:/, 'postgresql:')).hostname;
+        } catch {
+          return 'unknown';
+        }
+      })();
+      throw new Error(
+        `Cannot reach PostgreSQL host "${host}". On Render: open your Postgres instance → copy a fresh ` +
+          `Internal Database URL → Web service (sales-audit-2.0-2) → Environment → DATABASE_URL → Save & redeploy. ` +
+          `If the database was deleted (free tier expiry), create a new Postgres and link it.`
+      );
+    }
+    throw err;
+  }
 }
 
 async function ensureSession(sessionId) {
