@@ -1743,7 +1743,7 @@ function $(id) { return document.getElementById(id); }
 // =================================================================
 const USE_BACKEND = location.protocol === 'http:' || location.protocol === 'https:';
 const SESSION_STORAGE_KEY = 'sentinel_session_id';
-const SENTINEL_BUILD = '2026.07.04';
+const SENTINEL_BUILD = '2026.07.05';
 const API_KEY_STORAGE = 'sentinel_anthropic_api_key';
 /** Anthropic model for bill OCR & verification */
 const ANTHROPIC_MODEL = 'claude-sonnet-4-6';
@@ -5881,6 +5881,47 @@ function resetBillUpload() {
   ensureBillInput();
 }
 
+async function compressBillImageIfNeeded(file) {
+  if (!file.type.startsWith('image/') || file.size < 450 * 1024) return file;
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const maxDim = 2048;
+      let { width, height } = img;
+      if (width <= maxDim && height <= maxDim && file.size < 1.5 * 1024 * 1024) {
+        resolve(file);
+        return;
+      }
+      const scale = maxDim / Math.max(width, height);
+      width = Math.max(1, Math.round(width * scale));
+      height = Math.max(1, Math.round(height * scale));
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+      canvas.toBlob(
+        (blob) => {
+          if (!blob) {
+            resolve(file);
+            return;
+          }
+          const outName = file.name.replace(/\.(png|webp|gif)$/i, '.jpg');
+          resolve(new File([blob], outName, { type: 'image/jpeg' }));
+        },
+        'image/jpeg',
+        0.88
+      );
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve(file);
+    };
+    img.src = url;
+  });
+}
+
 async function loadBillFile(file) {
   const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
   const maxBytes = isPdf ? 8 * 1024 * 1024 : 5 * 1024 * 1024;
@@ -5897,22 +5938,29 @@ async function loadBillFile(file) {
       <span class="ai-spinner" style="width:20px;height:20px;flex-shrink:0"></span>
       <div class="bill-info">
         <div class="bill-name">${escapeHtml(file.name)}</div>
-        <div class="bill-meta">Reading ${kind}…</div>
+        <div class="bill-meta">Preparing ${kind}…</div>
       </div>
     </div>
   `;
   ensureBillInput();
 
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    pendingBillDataUrl = e.target.result;
-    renderBillPreview(file, kind);
-  };
-  reader.onerror = () => {
-    alert('Could not read the bill file. Please try again.');
+  try {
+    const prepared = await compressBillImageIfNeeded(file);
+    pendingBillFile = prepared;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      pendingBillDataUrl = e.target.result;
+      renderBillPreview(prepared, billFileKindLabel(prepared));
+    };
+    reader.onerror = () => {
+      alert('Could not read the bill file. Please try again.');
+      resetBillUpload();
+    };
+    reader.readAsDataURL(prepared);
+  } catch {
+    alert('Could not prepare the bill file. Please try again.');
     resetBillUpload();
-  };
-  reader.readAsDataURL(file);
+  }
 }
 
 // API Key management — dedicated modal
@@ -6353,7 +6401,9 @@ ${claim.geo.plannedTown ? `- Distance from planned audit town (${claim.geo.plann
 - Attendance status: ${claim.geo.onField ? 'On field' : 'Off field / absent'}
 ` : '';
 
-  const prompt = `You are a bill-verification AI agent for an expense reimbursement system. Examine the attached bill (image or PDF) and verify it against the claim details below.
+  const prompt = `You are an expense bill OCR and verification engine for Indian reimbursement claims.
+
+In ONE pass, extract all visible bill fields AND verify the bill against the claim below.
 
 Claim details:
 - Auditor: ${claim.auditorName} (${claim.auditorCode})
@@ -6365,34 +6415,37 @@ Claim details:
 ${claim.reason ? `- Reason for external booking: ${claim.reason}` : ''}
 ${claim.notes ? `- Notes: ${claim.notes}` : ''}${geoBlock}
 
-Examine the bill carefully and respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
+Respond ONLY with JSON (no markdown):
 {
-  "billDate": "YYYY-MM-DD or null if illegible",
+  "transactionId": "string or null",
+  "billDate": "YYYY-MM-DD or null",
   "billAmount": number or null,
-  "vendor": "name of vendor/establishment or null",
+  "vendor": "string or null",
+  "billLocation": "string or null",
+  "ocrConfidence": number between 0 and 1,
+  "rawTextSnippet": "short excerpt",
   "billType": "train_ticket | flight_ticket | bus_ticket | hotel_invoice | restaurant_receipt | cab_receipt | other",
   "dateMatches": true | false | null,
   "amountMatches": true | false | null,
   "typeMatches": true | false,
   "locationConsistent": true | false | null,
-  "tamperingIndicators": ["list of any visible signs of editing/tampering, empty array if none"],
-  "concerns": ["list of any other concerns — wrong category, illegible bill, missing details, etc."],
+  "tamperingIndicators": [],
+  "concerns": [],
   "overallVerdict": "genuine | review | suspicious",
   "reasoning": "1-2 sentence explanation"
 }
 
-Strict rules:
-- "dateMatches" is true ONLY if the bill date exactly matches the expense date.
-- "amountMatches" is true ONLY if the bill total is within ₹10 of the claimed amount.
-- "typeMatches" is true ONLY if the bill type aligns with the claimed sub-category.
-- "locationConsistent" — set to false if the geofencing data above shows the auditor was AT HOME (≤5 km from home base) while claiming food/cab/local DA, or if their GPS location is >30 km from the planned audit town. Set to true if the auditor's GPS location matches a field location consistent with the claim. Set to null if no geo data is provided.
-- Mark "suspicious" if you see clear tampering, mismatched data, impossible details, OR locationConsistent is false.
-- Mark "review" if anything is unclear or partially mismatched.
-- Mark "genuine" only when everything aligns AND the auditor's location is consistent with the claim.`;
+Rules:
+- "dateMatches" true only if bill date matches expense date ${claim.date}.
+- "amountMatches" true only if bill total is within ₹10 of ₹${claim.amount}.
+- "typeMatches" true only if bill type matches ${claim.subcategoryLabel}.
+- "locationConsistent" false if geofencing shows auditor at home while claiming field expenses, or GPS >30 km from planned audit town.
+- Mark "suspicious" for tampering, clear mismatches, or locationConsistent false.
+- Mark "genuine" only when everything aligns.`;
 
   const body = {
     model: ANTHROPIC_MODEL,
-    max_tokens: 1024,
+    max_tokens: 1400,
     messages: [{
       role: 'user',
       content: buildBillAnthropicContentClient(claim, prompt),
@@ -6436,6 +6489,22 @@ Strict rules:
   } catch (err) {
     throw new Error('AI response was not valid JSON: ' + cleaned.slice(0, 200));
   }
+  let ocrConfidence = parseFloat(parsed.ocrConfidence);
+  if (Number.isNaN(ocrConfidence)) ocrConfidence = 0.85;
+  claim.ocr = {
+    transactionId: parsed.transactionId ? String(parsed.transactionId).trim() : null,
+    billDate: parsed.billDate ? String(parsed.billDate).slice(0, 10) : null,
+    billAmount: parsed.billAmount != null ? Number(parsed.billAmount) : null,
+    vendor: parsed.vendor ? String(parsed.vendor).trim() : null,
+    billLocation: parsed.billLocation ? String(parsed.billLocation).trim() : null,
+    confidence: Math.max(0, Math.min(1, ocrConfidence)),
+    rawTextSnippet: parsed.rawTextSnippet ? String(parsed.rawTextSnippet).slice(0, 500) : null,
+    extractedAt: new Date().toISOString(),
+  };
+  claim.detectedVendor = claim.ocr.vendor;
+  claim.detectedAmount = claim.ocr.billAmount;
+  claim.detectedDate = claim.ocr.billDate;
+  claim.detectedTransactionId = claim.ocr.transactionId;
   claim.aiResult = parsed;
   return parsed;
 }

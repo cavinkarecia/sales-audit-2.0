@@ -3,6 +3,7 @@ const { buildAuditorIndex, findAuditor, dateKey } = require('./utils');
 const { haversineKm, resolveCityCoords, nearestCityName } = require('./geo');
 const { callAnthropic, parseJsonFromModel } = require('./anthropic');
 const { buildBillAnthropicContent } = require('./bill-media');
+const { normalizeOcrResult } = require('./ocr');
 
 const DA_CAPS = { metro: 525, non_metro: 450 };
 const auditorIndex = buildAuditorIndex(AUDITOR_MASTER);
@@ -150,21 +151,22 @@ function applyRuleChecks(claim, ctx) {
   return claim;
 }
 
-async function verifyClaimWithAI(claim, apiKey) {
-  if (!claim.billDataUrl) throw new Error('No bill attached');
-
-  const geoBlock = claim.geo
-    ? `
+function buildVerifyGeoBlock(claim) {
+  if (!claim.geo) return '';
+  return `
 
 Field-presence verification (geofencing) for ${claim.date}:
 - GPS detected location: ${claim.geo.detectedCity}
 - Distance from auditor's home base (${claim.homeBase}): ${claim.geo.distFromHome != null ? `${claim.geo.distFromHome.toFixed(1)} km` : 'unknown'}
 ${claim.geo.plannedTown ? `- Distance from planned audit town (${claim.geo.plannedTown}): ${claim.geo.distFromPlannedTown != null ? `${claim.geo.distFromPlannedTown.toFixed(1)} km` : 'unknown'}` : '- No planned town in PJP'}
 - Attendance status: ${claim.geo.onField ? 'On field' : 'Off field / absent'}
-`
-    : '';
+`;
+}
 
-  const prompt = `You are a bill-verification AI agent for an expense reimbursement system. Examine the attached bill (image, PDF, or spreadsheet) and verify it against the claim details below.
+function buildCombinedBillPrompt(claim) {
+  return `You are an expense bill OCR and verification engine for Indian reimbursement claims (image, PDF, or spreadsheet).
+
+In ONE pass, extract all visible bill fields AND verify the bill against the claim below.
 
 Claim details:
 - Auditor: ${claim.auditorName} (${claim.auditorCode})
@@ -174,21 +176,17 @@ Claim details:
 - Claimed amount: ₹${claim.amount}
 - City type: ${claim.cityType === 'metro' ? 'Metro' : 'Non-metro'}
 ${claim.reason ? `- Reason for external booking: ${claim.reason}` : ''}
-${claim.notes ? `- Notes: ${claim.notes}` : ''}${geoBlock}
+${claim.notes ? `- Notes: ${claim.notes}` : ''}${buildVerifyGeoBlock(claim)}
 
-${claim.ocr ? `OCR already extracted:
-- Transaction ID: ${claim.ocr.transactionId || 'unknown'}
-- Bill date: ${claim.ocr.billDate || 'unknown'}
-- Bill amount: ${claim.ocr.billAmount != null ? '₹' + claim.ocr.billAmount : 'unknown'}
-- Vendor: ${claim.ocr.vendor || 'unknown'}
-- OCR confidence: ${claim.ocr.confidence != null ? (claim.ocr.confidence * 100).toFixed(0) + '%' : 'unknown'}
-` : ''}
-Examine the bill carefully and respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
+Respond ONLY with JSON (no markdown):
 {
-  "billDate": "YYYY-MM-DD or null if illegible",
+  "transactionId": "raw transaction / invoice / UPI ref as printed, or null",
+  "billDate": "YYYY-MM-DD or null",
   "billAmount": number or null,
-  "vendor": "name of vendor/establishment or null",
-  "transactionId": "string or null",
+  "vendor": "establishment name or null",
+  "billLocation": "city or address on bill or null",
+  "ocrConfidence": number between 0 and 1,
+  "rawTextSnippet": "short excerpt of key lines",
   "billType": "train_ticket | flight_ticket | bus_ticket | hotel_invoice | restaurant_receipt | cab_receipt | other",
   "dateMatches": true | false | null,
   "amountMatches": true | false | null,
@@ -198,15 +196,63 @@ Examine the bill carefully and respond ONLY with a JSON object in this exact sha
   "concerns": [],
   "overallVerdict": "genuine | review | suspicious",
   "reasoning": "1-2 sentence explanation"
-}`;
+}
 
+Rules:
+- "dateMatches" true only if bill date matches expense date ${claim.date}.
+- "amountMatches" true only if bill total is within ₹10 of ₹${claim.amount}.
+- "typeMatches" true only if bill type matches ${claim.subcategoryLabel}.
+- "locationConsistent" false if geofencing shows auditor at home (≤5 km from base) while claiming field expenses, or GPS >30 km from planned audit town.
+- Mark "suspicious" for tampering, clear mismatches, or locationConsistent false.
+- Mark "genuine" only when everything aligns.`;
+}
+
+function splitCombinedBillResult(raw) {
+  if (!raw || typeof raw !== 'object') {
+    throw new Error('AI returned invalid bill analysis JSON');
+  }
+  const ocr = normalizeOcrResult({
+    transactionId: raw.transactionId,
+    billDate: raw.billDate,
+    billAmount: raw.billAmount,
+    vendor: raw.vendor,
+    billLocation: raw.billLocation,
+    ocrConfidence: raw.ocrConfidence,
+    rawTextSnippet: raw.rawTextSnippet,
+  });
+  const aiResult = {
+    billDate: raw.billDate ?? null,
+    billAmount: raw.billAmount != null ? Number(raw.billAmount) : null,
+    vendor: raw.vendor ?? null,
+    transactionId: raw.transactionId ?? null,
+    billType: raw.billType ?? null,
+    dateMatches: raw.dateMatches ?? null,
+    amountMatches: raw.amountMatches ?? null,
+    typeMatches: raw.typeMatches ?? null,
+    locationConsistent: raw.locationConsistent ?? null,
+    tamperingIndicators: Array.isArray(raw.tamperingIndicators) ? raw.tamperingIndicators : [],
+    concerns: Array.isArray(raw.concerns) ? raw.concerns : [],
+    overallVerdict: raw.overallVerdict || 'review',
+    reasoning: raw.reasoning || null,
+  };
+  return { ocr, aiResult };
+}
+
+/** Single vision call: OCR extraction + verification (faster than two separate API calls). */
+async function extractAndVerifyBill(claim, apiKey) {
+  if (!claim.billDataUrl) throw new Error('No bill attached');
   const text = await callAnthropic({
     apiKey,
-    maxTokens: 1024,
-    userContent: buildBillAnthropicContent(claim, prompt),
+    maxTokens: 1400,
+    userContent: buildBillAnthropicContent(claim, buildCombinedBillPrompt(claim)),
   });
+  return splitCombinedBillResult(parseJsonFromModel(text));
+}
 
-  return parseJsonFromModel(text);
+async function verifyClaimWithAI(claim, apiKey) {
+  if (!claim.billDataUrl) throw new Error('No bill attached');
+  const { aiResult } = await extractAndVerifyBill(claim, apiKey);
+  return aiResult;
 }
 
 function mergeAiVerdict(claim) {
@@ -276,6 +322,7 @@ Respond ONLY with a JSON object in this exact shape (no markdown, no preamble):
 module.exports = {
   applyRuleChecks,
   verifyClaimWithAI,
+  extractAndVerifyBill,
   mergeAiVerdict,
   rosterAiReview,
   buildIndexes,
